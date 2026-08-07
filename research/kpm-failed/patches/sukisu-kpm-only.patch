@@ -1,0 +1,254 @@
+diff --git a/kernel/kpm/compact.c b/kernel/kpm/compact.c
+index b9f9d4f3..031cb54b 100644
+--- a/kernel/kpm/compact.c
++++ b/kernel/kpm/compact.c
+@@ -20,7 +20,6 @@
+ #include <asm/cacheflush.h>
+ #include <linux/module.h>
+ #include <linux/vmalloc.h>
+-#include <linux/set_memory.h>
+ #include <linux/version.h>
+ #include <linux/export.h>
+ #include <linux/slab.h>
+diff --git a/kernel/kpm/kpm.c b/kernel/kpm/kpm.c
+index c96106bb..adf6fe8f 100644
+--- a/kernel/kpm/kpm.c
++++ b/kernel/kpm/kpm.c
+@@ -26,12 +26,9 @@
+ #include <linux/string.h>
+ #include <asm/cacheflush.h>
+ #include <linux/module.h>
+-#include <linux/set_memory.h>
+ #include <linux/export.h>
+ #include <linux/slab.h>
+ #include <asm/insn.h>
+-#include <linux/kprobes.h>
+-#include <linux/stacktrace.h>
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) && defined(CONFIG_MODULES)
+ #include <linux/moduleloader.h>
+ #endif
+@@ -39,6 +36,12 @@
+ #define KPM_NAME_LEN 32
+ #define KPM_ARGS_LEN 1024
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
++#define kpm_access_ok(addr, size) access_ok(VERIFY_READ, (void __user *)(addr), (size))
++#else
++#define kpm_access_ok(addr, size) access_ok((void __user *)(addr), (size))
++#endif
++
+ #ifndef NO_OPTIMIZE
+ #if defined(__GNUC__) && !defined(__clang__)
+ #define NO_OPTIMIZE __attribute__((optimize("O0")))
+@@ -132,14 +135,14 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+             goto exit;
+         }
+ 
+-        if (!access_ok(arg1, 255)) {
++        if (!kpm_access_ok(arg1, 255)) {
+             goto invalid_arg;
+         }
+ 
+         strncpy_from_user((char *)&kernel_load_path, (const char *)arg1, 255);
+ 
+         if (arg2 != 0) {
+-            if (!access_ok(arg2, 255)) {
++            if (!kpm_access_ok(arg2, 255)) {
+                 goto invalid_arg;
+             }
+ 
+@@ -158,7 +161,7 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+             goto exit;
+         }
+ 
+-        if (!access_ok(arg1, sizeof(kernel_name_buffer))) {
++        if (!kpm_access_ok(arg1, sizeof(kernel_name_buffer))) {
+             goto invalid_arg;
+         }
+ 
+@@ -178,7 +181,7 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+             goto exit;
+         }
+ 
+-        if (!access_ok(arg1, sizeof(kernel_name_buffer))) {
++        if (!kpm_access_ok(arg1, sizeof(kernel_name_buffer))) {
+             goto invalid_arg;
+         }
+ 
+@@ -189,11 +192,11 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+         sukisu_kpm_info((const char *)&kernel_name_buffer, (char *)&buf,
+                         sizeof(buf), &size);
+ 
+-        if (!access_ok(arg2, size)) {
++        if (!kpm_access_ok(arg2, size)) {
+             goto invalid_arg;
+         }
+ 
+-        res = copy_to_user(arg2, &buf, size);
++        res = copy_to_user((void __user *)arg2, &buf, size);
+ 
+     } else if (control_code == SUKISU_KPM_LIST) {
+         char buf[1024];
+@@ -204,7 +207,7 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+             goto exit;
+         }
+ 
+-        if (!access_ok(arg2, len)) {
++        if (!kpm_access_ok(arg1, len)) {
+             goto invalid_arg;
+         }
+ 
+@@ -215,18 +218,18 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+             goto exit;
+         }
+ 
+-        if (copy_to_user(arg1, &buf, len) != 0)
++        if (copy_to_user((void __user *)arg1, &buf, len) != 0)
+             pr_info("kpm: Copy to user failed.");
+ 
+     } else if (control_code == SUKISU_KPM_CONTROL) {
+         char kpm_name[KPM_NAME_LEN] = { 0 };
+         char kpm_args[KPM_ARGS_LEN] = { 0 };
+ 
+-        if (!access_ok(arg1, sizeof(kpm_name))) {
++        if (!kpm_access_ok(arg1, sizeof(kpm_name))) {
+             goto invalid_arg;
+         }
+ 
+-        if (!access_ok(arg2, sizeof(kpm_args))) {
++        if (!kpm_access_ok(arg2, sizeof(kpm_args))) {
+             goto invalid_arg;
+         }
+ 
+@@ -253,11 +256,11 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+         if (len >= outlen)
+             len = outlen - 1;
+ 
+-        res = copy_to_user(arg1, &buffer, len + 1);
++        res = copy_to_user((void __user *)arg1, &buffer, len + 1);
+     }
+ 
+ exit:
+-    if (copy_to_user(result_code, &res, sizeof(res)) != 0)
++    if (copy_to_user((void __user *)result_code, &res, sizeof(res)) != 0)
+         pr_info("kpm: Copy to user failed.");
+ 
+     return 0;
+@@ -286,13 +289,13 @@ int do_kpm(void __user *arg)
+         return -EFAULT;
+     }
+ 
+-    if (!access_ok(cmd.control_code, sizeof(int))) {
++    if (!kpm_access_ok(cmd.control_code, sizeof(int))) {
+         pr_err("kpm: invalid control_code pointer %px\n",
+                (void *)cmd.control_code);
+         return -EFAULT;
+     }
+ 
+-    if (!access_ok(cmd.result_code, sizeof(int))) {
++    if (!kpm_access_ok(cmd.result_code, sizeof(int))) {
+         pr_err("kpm: invalid result_code pointer %px\n",
+                (void *)cmd.result_code);
+         return -EFAULT;
+diff --git a/kernel/kpm/super_access.c b/kernel/kpm/super_access.c
+index b95292d3..15adef9a 100644
+--- a/kernel/kpm/super_access.c
++++ b/kernel/kpm/super_access.c
+@@ -20,7 +20,6 @@
+ #include <asm/cacheflush.h>
+ #include <linux/module.h>
+ #include <linux/vmalloc.h>
+-#include <linux/set_memory.h>
+ #include <linux/version.h>
+ #include <linux/export.h>
+ #include <linux/slab.h>
+@@ -160,9 +159,6 @@ DEFINE_MEMBER(task_struct, thread_info)
+ #ifdef CONFIG_CGROUPS
+ DEFINE_MEMBER(task_struct, cgroups)
+ #endif
+-#ifdef CONFIG_SECURITY
+-DEFINE_MEMBER(task_struct, security)
+-#endif
+ DEFINE_MEMBER(task_struct, thread)
+ DYNAMIC_STRUCT_END(task_struct)
+ 
+@@ -188,7 +184,9 @@ static struct DynamicStructInfo *dynamic_struct_infos[] = {
+ int sukisu_super_find_struct(const char *struct_name, size_t *out_size,
+                              int *out_members)
+ {
+-    for (size_t i = 0;
++    size_t i;
++
++    for (i = 0;
+          i < (sizeof(dynamic_struct_infos) / sizeof(dynamic_struct_infos[0]));
+          i++) {
+         struct DynamicStructInfo *info = dynamic_struct_infos[i];
+@@ -217,19 +215,21 @@ EXPORT_SYMBOL(sukisu_super_find_struct);
+ int sukisu_super_access(const char *struct_name, const char *member_name,
+                         size_t *out_offset, size_t *out_size)
+ {
+-    for (size_t i = 0;
++    size_t i, i1;
++
++    for (i = 0;
+          i < (sizeof(dynamic_struct_infos) / sizeof(dynamic_struct_infos[0]));
+          i++) {
+         struct DynamicStructInfo *info = dynamic_struct_infos[i];
+ 
+         if (strcmp(struct_name, info->name) == 0) {
+-            for (size_t i1 = 0; i1 < info->count; i1++) {
++            for (i1 = 0; i1 < info->count; i1++) {
+                 if (strcmp(info->members[i1].name, member_name) == 0) {
+                     if (out_offset)
+-                        *out_offset = info->members[i].offset;
++                        *out_offset = info->members[i1].offset;
+ 
+                     if (out_size)
+-                        *out_size = info->members[i].size;
++                        *out_size = info->members[i1].size;
+ 
+                     return 0;
+                 }
+@@ -255,16 +255,18 @@ EXPORT_SYMBOL(sukisu_super_access);
+ int sukisu_super_container_of(const char *struct_name, const char *member_name,
+                               void *ptr, void **out_ptr)
+ {
++    size_t i, i1;
++
+     if (ptr == NULL)
+         return -3;
+ 
+-    for (size_t i = 0;
++    for (i = 0;
+          i < (sizeof(dynamic_struct_infos) / sizeof(dynamic_struct_infos[0]));
+          i++) {
+         struct DynamicStructInfo *info = dynamic_struct_infos[i];
+ 
+         if (strcmp(struct_name, info->name) == 0) {
+-            for (size_t i1 = 0; i1 < info->count; i1++) {
++            for (i1 = 0; i1 < info->count; i1++) {
+                 if (strcmp(info->members[i1].name, member_name) == 0) {
+                     *out_ptr = (void *)DYNAMIC_CONTAINER_OF(
+                         info->members[i1].offset, ptr);
+diff --git a/kernel/kpm_map_area.S b/kernel/kpm_map_area.S
+new file mode 100644
+index 00000000..c42cbc87
+--- /dev/null
++++ b/kernel/kpm_map_area.S
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++/*
++ * Dedicated early executable scratch area for KernelPatch.  The generic
++ * non-GKI patcher otherwise borrows tcp_init_sock and must restore it before
++ * networking starts.  Keeping a private area makes staged bring-up safe and
++ * avoids overwriting a live kernel function.
++ */
++
++	.section ".text.kpm_map_area", "ax"
++	.balign 0x800
++	.global kpm_early_map_area
++	.type kpm_early_map_area, %function
++kpm_early_map_area:
++	.space 0x800, 0
++	.size kpm_early_map_area, . - kpm_early_map_area

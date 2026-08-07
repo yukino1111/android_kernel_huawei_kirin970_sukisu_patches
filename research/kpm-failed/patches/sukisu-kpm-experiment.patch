@@ -1,0 +1,887 @@
+diff --git a/kernel/Kconfig b/kernel/Kconfig
+index 0cc760f1..e85baac9 100644
+--- a/kernel/Kconfig
++++ b/kernel/Kconfig
+@@ -42,6 +42,13 @@ config KSU_SUSFS
+ 	help
+ 	  Patch and Enable SUSFS to kernel with KernelSU.
+ 
++config KSU_SUSFS_HAS_MAGIC_MOUNT
++	bool "KernelSU uses Magic Mount"
++	depends on KSU_SUSFS
++	default y
++	help
++	  Enable the automatic hiding paths for SukiSU's Magic Mount.
++
+ config KSU_SUSFS_SUS_PATH
+ 	bool "Enable to hide suspicious path"
+ 	depends on KSU_SUSFS
+@@ -61,6 +68,16 @@ config KSU_SUSFS_SUS_MOUNT
+ 	  - Automatically assign fake mnt_id and fake mnt_group_id for mounts mounted by ksu process until /sdcard is  decrypted, this is to evade from mnt_id/mnt_group_id gap detections.
+ 	  - Allow hiding all sus mounts from /proc/self/[mounts|mountinfo|mountstat] for non-su processes.
+ 
++config KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
++	bool "Automatically hide KernelSU default mounts"
++	depends on KSU_SUSFS_SUS_MOUNT
++	default y
++
++config KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
++	bool "Automatically hide KernelSU bind mounts"
++	depends on KSU_SUSFS_SUS_MOUNT
++	default y
++
+ config KSU_SUSFS_SUS_KSTAT
+ 	bool "Enable to spoof suspicious kstat"
+ 	depends on KSU_SUSFS
+@@ -114,7 +131,7 @@ config KSU_SUSFS_OPEN_REDIRECT
+ config KSU_SUSFS_SUS_MAP
+ 	bool "Enable to hide some mmapped real file from different proc maps interfaces"
+ 	depends on KSU_SUSFS
+-	default y
++	default n
+ 	help
+ 	  - Allow hiding mmapped real file from /proc/<pid>/[maps|smaps|smaps_rollup|map_files|mem|pagemap]
+ 	  - It does NOT support hiding for anon memory.
+@@ -122,6 +139,31 @@ config KSU_SUSFS_SUS_MAP
+ 	  - It may not be able to evade detections by apps that implement a good injection detection.
+ 	  - Effective only on zygote spawned umounted user app process >= 10000.
+ 
++config KSU_SUSFS_SUS_OVERLAYFS
++	bool "Spoof overlayfs metadata"
++	depends on KSU_SUSFS
++	default n
++	help
++	  Intended for legacy overlay mounts. SukiSU Magic Mount normally does not
++	  need this in addition to automatic mount hiding.
++
++config KSU_SUSFS_TRY_UMOUNT
++	bool "Unmount configured suspicious mounts for app processes"
++	depends on KSU_SUSFS
++	default y
++
++config KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
++	bool "Automatically add bind mounts to try-umount"
++	depends on KSU_SUSFS_TRY_UMOUNT
++	default y
++
++config KSU_SUSFS_SUS_SU
++	bool "SuSFS SUS_SU mode"
++	depends on KSU_SUSFS && KPROBES
++	default n
++	help
++	  Keep disabled on this Huawei 4.9 kernel because kprobes are unavailable.
++
+ endmenu
+ 
+ endmenu
+diff --git a/kernel/Makefile b/kernel/Makefile
+index e4d274d8..81ba8c30 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -1,8 +1,16 @@
+ obj-$(CONFIG_KSU) := ksu.o
++obj-$(CONFIG_KPM) += kpm_map_area.o
+ 
+ ccflags-y += -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
+ ccflags-y += -I$(objtree)/security/selinux -include $(srctree)/include/uapi/asm-generic/errno.h
+ 
++# Huawei's 4.9 policydb keeps type_attr_map as a direct ebitmap pointer.
++# Detect the actual source layout because HISI_SELINUX_EBITMAP_RO is defined
++# too late for kernel_compat.h to use as a reliable preprocessor probe.
++ifeq ($(shell grep -q 'struct ebitmap \*type_attr_map;' $(srctree)/security/selinux/ss/policydb.h 2>/dev/null; echo $$?),0)
++ccflags-y += -DCONFIG_IS_HW_HISI
++endif
++
+ ifeq ($(filter /%,$(src)),)
+ KSU_KERNEL_DIR := $(srctree)/$(src)
+ else
+@@ -43,9 +51,11 @@ GITHUB_API_BASE  := https://api.github.com/repos/$(REPO_OWNER)/$(REPO_NAME)
+ KSU_GITHUB_VER   := $(shell $(CURL_BIN) -s "$(GITHUB_API_BASE)/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
+ GITHUB_COMMITS   := $(shell $(CURL_BIN) -sI "$(GITHUB_API_BASE)/commits?sha=$(REPO_BRANCH)&per_page=1" 2>/dev/null | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p')
+ LOCAL_COUNT     := $(if $(GITHUB_COMMITS),$(GITHUB_COMMITS),$(git_commit_count))
+-KSU_VERSION     := $(if $(LOCAL_COUNT),$(shell expr $(VERSION_BASE) + $(LOCAL_COUNT) - $(VERSION_OFFSET)),13000)
+-VERSION_TAG     := $(or $(KSU_GITHUB_VER),$(git_latest_tag),4.1.2)
+-KSU_VERSION_FULL := $(if $(call git_short_sha),v$(VERSION_TAG)-$(call git_short_sha)@$(call git_branch),v$(VERSION_TAG)-$(REPO_NAME)-unknown@unknown)
++# Keep the Huawei 4.9 build reproducible instead of deriving its identity from
++# the moving main branch and latest GitHub release.
++KSU_VERSION      := 40856
++VERSION_TAG      := 4.1.3
++KSU_VERSION_FULL := v4.1.3-b1d534bc@builtin
+ $(info -- $(REPO_NAME) version: $(KSU_VERSION) [$(KSU_VERSION_FULL)])
+ 
+ ccflags-y += -DKSU_VERSION=$(KSU_VERSION)
+diff --git a/kernel/feature/kernel_umount.c b/kernel/feature/kernel_umount.c
+index 13426406..0b3d9b69 100644
+--- a/kernel/feature/kernel_umount.c
++++ b/kernel/feature/kernel_umount.c
+@@ -48,6 +48,28 @@ static void try_umount(const char *mnt, int flags)
+     ksu_umount_mnt(mnt, &path, flags);
+ }
+ 
++#if defined(CONFIG_KSU_SUSFS_TRY_UMOUNT) && !defined(KSU_SUSFS_NATIVE_V2)
++extern bool susfs_is_mnt_devname_ksu(struct path *path);
++
++/* ABI used by the SuSFS v1.5.5 core. */
++void ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid)
++{
++    struct path path;
++    int err = kern_path(mnt, 0, &path);
++
++    if (err)
++        return;
++    if (path.dentry != path.mnt->mnt_root ||
++        (check_mnt && !susfs_is_mnt_devname_ksu(&path))) {
++        path_put(&path);
++        return;
++    }
++
++    pr_info("susfs: unmounting %s for uid %u\n", mnt, uid);
++    ksu_umount_mnt(mnt, &path, flags);
++}
++#endif
++
+ struct umount_tw {
+     struct callback_head cb;
+ };
+diff --git a/kernel/hook/lsm_hook.c b/kernel/hook/lsm_hook.c
+index 00702832..5d5263ab 100644
+--- a/kernel/hook/lsm_hook.c
++++ b/kernel/hook/lsm_hook.c
+@@ -19,15 +19,6 @@ static int ksu_key_permission(key_ref_t key_ref, const struct cred *cred, unsign
+ #ifdef CONFIG_KSU_SUSFS
+ extern u32 susfs_zygote_sid;
+ extern void disable_seccomp(void);
+-extern struct work_struct susfs_extra_works;
+-
+-static inline void ksu_handle_extra_susfs_work(void)
+-{
+-    if (work_pending(&susfs_extra_works))
+-        return;
+-
+-    schedule_work(&susfs_extra_works);
+-}
+ 
+ int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid)
+ {
+@@ -70,8 +61,10 @@ do_umount:
+         // Handle kernel umount
+         ksu_handle_umount(current_uid().val, ruid);
+ 
+-        // Handle extra susfs work
+-        ksu_handle_extra_susfs_work();
++#if defined(CONFIG_KSU_SUSFS_TRY_UMOUNT) && !defined(KSU_SUSFS_NATIVE_V2)
++        // SuSFS v1.5.5 keeps its own ordered list of extra mounts.
++        susfs_try_umount(ruid);
++#endif
+     }
+ 
+     // Mark current proc as umounted
+@@ -79,8 +72,44 @@ do_umount:
+ 
+     return 0;
+ }
++
++#ifdef KSU_SUSFS_NATIVE_V2
++/*
++ * Native SuSFS invokes ksu_handle_setresuid() directly from setresuid(2).
++ * Keep a manager-only LSM fallback for vendor kernels whose zygote path does
++ * not reach that direct hook with the expected SID.  Without this, the
++ * manager inherits Android's seccomp filter and ksud's reboot supercall probe
++ * is killed with SIGSYS before it can report the kernel as rooted.
++ */
++static int ksu_task_fix_setuid(struct cred *new, const struct cred *old, int flags)
++{
++    uid_t new_uid;
++
++    if (unlikely(!new || !old))
++        return 0;
++
++    new_uid = new->uid.val;
++    if (likely(ksu_is_manager_appid_valid()) &&
++        unlikely(is_uid_manager(new_uid)) &&
++        test_thread_flag(TIF_SECCOMP)) {
++        disable_seccomp();
++        pr_info("native susfs manager seccomp fallback: %d\n", new_uid);
++        ksu_install_fd();
++    }
++
++    return 0;
++}
+ #else
+ static int ksu_task_fix_setuid(struct cred *new, const struct cred *old, int flags)
++{
++    if (unlikely(!new || !old))
++        return 0;
++
++    return ksu_handle_setresuid(new->uid.val, new->euid.val, new->suid.val);
++}
++#endif
++#else /* !CONFIG_KSU_SUSFS */
++static int ksu_task_fix_setuid(struct cred *new, const struct cred *old, int flags)
+ {
+     uid_t new_uid, old_uid = 0;
+ 
+@@ -108,13 +137,153 @@ static int ksu_task_fix_setuid(struct cred *new, const struct cred *old, int fla
+ }
+ #endif
+ 
++#if defined(CONFIG_KSU_SUSFS) && !defined(KSU_SUSFS_NATIVE_V2)
++#define KSU_LEGACY_PRCTL_OPTION 0xDEADBEEFu
++
++static int ksu_susfs_prctl_reply(unsigned long arg5, int error)
++{
++    if (!arg5 || copy_to_user((void __user *)arg5, &error, sizeof(error)))
++        return -EFAULT;
++    return 0;
++}
++
++/* Keep the official SuSFS v1.5.5 module/tool ABI usable on current SukiSU. */
++static int ksu_susfs_task_prctl(int option, unsigned long arg2,
++                                unsigned long arg3, unsigned long arg4,
++                                unsigned long arg5)
++{
++    int error = -EOPNOTSUPP;
++
++    if ((unsigned int)option != KSU_LEGACY_PRCTL_OPTION)
++        return -ENOSYS;
++    if (current_uid().val != 0)
++        return -EPERM;
++
++    switch (arg2) {
++#ifdef CONFIG_KSU_SUSFS_SUS_PATH
++    case CMD_SUSFS_ADD_SUS_PATH:
++        error = susfs_add_sus_path((struct st_susfs_sus_path __user *)arg3);
++        break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++    case CMD_SUSFS_ADD_SUS_MOUNT:
++        error = susfs_add_sus_mount((struct st_susfs_sus_mount __user *)arg3);
++        break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
++    case CMD_SUSFS_ADD_SUS_KSTAT:
++    case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY:
++        error = susfs_add_sus_kstat((struct st_susfs_sus_kstat __user *)arg3);
++        break;
++    case CMD_SUSFS_UPDATE_SUS_KSTAT:
++        error = susfs_update_sus_kstat((struct st_susfs_sus_kstat __user *)arg3);
++        break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
++    case CMD_SUSFS_ADD_TRY_UMOUNT:
++        error = susfs_add_try_umount((struct st_susfs_try_umount __user *)arg3);
++        break;
++    case CMD_SUSFS_RUN_UMOUNT_FOR_CURRENT_MNT_NS:
++        susfs_try_umount(current_uid().val);
++        error = 0;
++        break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
++    case CMD_SUSFS_SET_UNAME:
++        error = susfs_set_uname((struct st_susfs_uname __user *)arg3);
++        break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
++    case CMD_SUSFS_ENABLE_LOG:
++        if (arg3 > 1)
++            error = -EINVAL;
++        else {
++            susfs_set_log(!!arg3);
++            error = 0;
++        }
++        break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
++    case CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG:
++        error = susfs_set_cmdline_or_bootconfig((char __user *)arg3);
++        break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
++    case CMD_SUSFS_ADD_OPEN_REDIRECT:
++        error = susfs_add_open_redirect((struct st_susfs_open_redirect __user *)arg3);
++        break;
++#endif
++    case CMD_SUSFS_SHOW_VERSION:
++        error = copy_to_user((void __user *)arg3, SUSFS_VERSION,
++                             strlen(SUSFS_VERSION) + 1);
++        break;
++    case CMD_SUSFS_SHOW_VARIANT:
++        error = copy_to_user((void __user *)arg3, SUSFS_VARIANT,
++                             strlen(SUSFS_VARIANT) + 1);
++        break;
++    case CMD_SUSFS_SHOW_ENABLED_FEATURES: {
++        u64 features = 0;
++#ifdef CONFIG_KSU_SUSFS_SUS_PATH
++        features |= 1ULL << 0;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++        features |= 1ULL << 1;
++#endif
++#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
++        features |= 1ULL << 2;
++#endif
++#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
++        features |= 1ULL << 3;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
++        features |= 1ULL << 4;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SUS_OVERLAYFS
++        features |= 1ULL << 5;
++#endif
++#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
++        features |= 1ULL << 6;
++#endif
++#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
++        features |= 1ULL << 7;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
++        features |= 1ULL << 8;
++#endif
++#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
++        features |= 1ULL << 9;
++#endif
++#ifdef CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
++        features |= 1ULL << 10;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
++        features |= 1ULL << 11;
++#endif
++#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
++        features |= 1ULL << 12;
++#endif
++#ifdef CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
++        features |= 1ULL << 14;
++#endif
++        error = copy_to_user((void __user *)arg3, &features, sizeof(features));
++        break;
++    }
++    default:
++        return -EINVAL;
++    }
++
++    return ksu_susfs_prctl_reply(arg5, error);
++}
++#endif /* CONFIG_KSU_SUSFS && !KSU_SUSFS_NATIVE_V2 */
++
+ static struct security_hook_list ksu_hooks[] = {
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) || defined(CONFIG_IS_HW_HISI) ||                                     \
+     defined(CONFIG_KSU_ALLOWLIST_WORKAROUND)
+     LSM_HOOK_INIT(key_permission, ksu_key_permission),
+ #endif
+-#ifndef CONFIG_KSU_SUSFS
+     LSM_HOOK_INIT(task_fix_setuid, ksu_task_fix_setuid),
++#if defined(CONFIG_KSU_SUSFS) && !defined(KSU_SUSFS_NATIVE_V2)
++    LSM_HOOK_INIT(task_prctl, ksu_susfs_task_prctl),
+ #endif
+ };
+ 
+diff --git a/kernel/infra/kernel_compat.h b/kernel/infra/kernel_compat.h
+index 5b10ee74..a9b0669f 100644
+--- a/kernel/infra/kernel_compat.h
++++ b/kernel/infra/kernel_compat.h
+@@ -4,9 +4,11 @@
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)) && (LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0)) ||              \
+     (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)) && (LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0))
+ #ifdef HISI_SELINUX_EBITMAP_RO
++#ifndef CONFIG_IS_HW_HISI
+ #define CONFIG_IS_HW_HISI
+ #endif
+ #endif
++#endif
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) || defined(CONFIG_IS_HW_HISI) ||                                     \
+     defined(CONFIG_KSU_ALLOWLIST_WORKAROUND)
+diff --git a/kernel/kpm/compact.c b/kernel/kpm/compact.c
+index b9f9d4f3..031cb54b 100644
+--- a/kernel/kpm/compact.c
++++ b/kernel/kpm/compact.c
+@@ -20,7 +20,6 @@
+ #include <asm/cacheflush.h>
+ #include <linux/module.h>
+ #include <linux/vmalloc.h>
+-#include <linux/set_memory.h>
+ #include <linux/version.h>
+ #include <linux/export.h>
+ #include <linux/slab.h>
+diff --git a/kernel/kpm/kpm.c b/kernel/kpm/kpm.c
+index c96106bb..adf6fe8f 100644
+--- a/kernel/kpm/kpm.c
++++ b/kernel/kpm/kpm.c
+@@ -26,12 +26,9 @@
+ #include <linux/string.h>
+ #include <asm/cacheflush.h>
+ #include <linux/module.h>
+-#include <linux/set_memory.h>
+ #include <linux/export.h>
+ #include <linux/slab.h>
+ #include <asm/insn.h>
+-#include <linux/kprobes.h>
+-#include <linux/stacktrace.h>
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) && defined(CONFIG_MODULES)
+ #include <linux/moduleloader.h>
+ #endif
+@@ -39,6 +36,12 @@
+ #define KPM_NAME_LEN 32
+ #define KPM_ARGS_LEN 1024
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
++#define kpm_access_ok(addr, size) access_ok(VERIFY_READ, (void __user *)(addr), (size))
++#else
++#define kpm_access_ok(addr, size) access_ok((void __user *)(addr), (size))
++#endif
++
+ #ifndef NO_OPTIMIZE
+ #if defined(__GNUC__) && !defined(__clang__)
+ #define NO_OPTIMIZE __attribute__((optimize("O0")))
+@@ -132,14 +135,14 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+             goto exit;
+         }
+ 
+-        if (!access_ok(arg1, 255)) {
++        if (!kpm_access_ok(arg1, 255)) {
+             goto invalid_arg;
+         }
+ 
+         strncpy_from_user((char *)&kernel_load_path, (const char *)arg1, 255);
+ 
+         if (arg2 != 0) {
+-            if (!access_ok(arg2, 255)) {
++            if (!kpm_access_ok(arg2, 255)) {
+                 goto invalid_arg;
+             }
+ 
+@@ -158,7 +161,7 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+             goto exit;
+         }
+ 
+-        if (!access_ok(arg1, sizeof(kernel_name_buffer))) {
++        if (!kpm_access_ok(arg1, sizeof(kernel_name_buffer))) {
+             goto invalid_arg;
+         }
+ 
+@@ -178,7 +181,7 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+             goto exit;
+         }
+ 
+-        if (!access_ok(arg1, sizeof(kernel_name_buffer))) {
++        if (!kpm_access_ok(arg1, sizeof(kernel_name_buffer))) {
+             goto invalid_arg;
+         }
+ 
+@@ -189,11 +192,11 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+         sukisu_kpm_info((const char *)&kernel_name_buffer, (char *)&buf,
+                         sizeof(buf), &size);
+ 
+-        if (!access_ok(arg2, size)) {
++        if (!kpm_access_ok(arg2, size)) {
+             goto invalid_arg;
+         }
+ 
+-        res = copy_to_user(arg2, &buf, size);
++        res = copy_to_user((void __user *)arg2, &buf, size);
+ 
+     } else if (control_code == SUKISU_KPM_LIST) {
+         char buf[1024];
+@@ -204,7 +207,7 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+             goto exit;
+         }
+ 
+-        if (!access_ok(arg2, len)) {
++        if (!kpm_access_ok(arg1, len)) {
+             goto invalid_arg;
+         }
+ 
+@@ -215,18 +218,18 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+             goto exit;
+         }
+ 
+-        if (copy_to_user(arg1, &buf, len) != 0)
++        if (copy_to_user((void __user *)arg1, &buf, len) != 0)
+             pr_info("kpm: Copy to user failed.");
+ 
+     } else if (control_code == SUKISU_KPM_CONTROL) {
+         char kpm_name[KPM_NAME_LEN] = { 0 };
+         char kpm_args[KPM_ARGS_LEN] = { 0 };
+ 
+-        if (!access_ok(arg1, sizeof(kpm_name))) {
++        if (!kpm_access_ok(arg1, sizeof(kpm_name))) {
+             goto invalid_arg;
+         }
+ 
+-        if (!access_ok(arg2, sizeof(kpm_args))) {
++        if (!kpm_access_ok(arg2, sizeof(kpm_args))) {
+             goto invalid_arg;
+         }
+ 
+@@ -253,11 +256,11 @@ noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1,
+         if (len >= outlen)
+             len = outlen - 1;
+ 
+-        res = copy_to_user(arg1, &buffer, len + 1);
++        res = copy_to_user((void __user *)arg1, &buffer, len + 1);
+     }
+ 
+ exit:
+-    if (copy_to_user(result_code, &res, sizeof(res)) != 0)
++    if (copy_to_user((void __user *)result_code, &res, sizeof(res)) != 0)
+         pr_info("kpm: Copy to user failed.");
+ 
+     return 0;
+@@ -286,13 +289,13 @@ int do_kpm(void __user *arg)
+         return -EFAULT;
+     }
+ 
+-    if (!access_ok(cmd.control_code, sizeof(int))) {
++    if (!kpm_access_ok(cmd.control_code, sizeof(int))) {
+         pr_err("kpm: invalid control_code pointer %px\n",
+                (void *)cmd.control_code);
+         return -EFAULT;
+     }
+ 
+-    if (!access_ok(cmd.result_code, sizeof(int))) {
++    if (!kpm_access_ok(cmd.result_code, sizeof(int))) {
+         pr_err("kpm: invalid result_code pointer %px\n",
+                (void *)cmd.result_code);
+         return -EFAULT;
+diff --git a/kernel/kpm/super_access.c b/kernel/kpm/super_access.c
+index b95292d3..15adef9a 100644
+--- a/kernel/kpm/super_access.c
++++ b/kernel/kpm/super_access.c
+@@ -20,7 +20,6 @@
+ #include <asm/cacheflush.h>
+ #include <linux/module.h>
+ #include <linux/vmalloc.h>
+-#include <linux/set_memory.h>
+ #include <linux/version.h>
+ #include <linux/export.h>
+ #include <linux/slab.h>
+@@ -160,9 +159,6 @@ DEFINE_MEMBER(task_struct, thread_info)
+ #ifdef CONFIG_CGROUPS
+ DEFINE_MEMBER(task_struct, cgroups)
+ #endif
+-#ifdef CONFIG_SECURITY
+-DEFINE_MEMBER(task_struct, security)
+-#endif
+ DEFINE_MEMBER(task_struct, thread)
+ DYNAMIC_STRUCT_END(task_struct)
+ 
+@@ -188,7 +184,9 @@ static struct DynamicStructInfo *dynamic_struct_infos[] = {
+ int sukisu_super_find_struct(const char *struct_name, size_t *out_size,
+                              int *out_members)
+ {
+-    for (size_t i = 0;
++    size_t i;
++
++    for (i = 0;
+          i < (sizeof(dynamic_struct_infos) / sizeof(dynamic_struct_infos[0]));
+          i++) {
+         struct DynamicStructInfo *info = dynamic_struct_infos[i];
+@@ -217,19 +215,21 @@ EXPORT_SYMBOL(sukisu_super_find_struct);
+ int sukisu_super_access(const char *struct_name, const char *member_name,
+                         size_t *out_offset, size_t *out_size)
+ {
+-    for (size_t i = 0;
++    size_t i, i1;
++
++    for (i = 0;
+          i < (sizeof(dynamic_struct_infos) / sizeof(dynamic_struct_infos[0]));
+          i++) {
+         struct DynamicStructInfo *info = dynamic_struct_infos[i];
+ 
+         if (strcmp(struct_name, info->name) == 0) {
+-            for (size_t i1 = 0; i1 < info->count; i1++) {
++            for (i1 = 0; i1 < info->count; i1++) {
+                 if (strcmp(info->members[i1].name, member_name) == 0) {
+                     if (out_offset)
+-                        *out_offset = info->members[i].offset;
++                        *out_offset = info->members[i1].offset;
+ 
+                     if (out_size)
+-                        *out_size = info->members[i].size;
++                        *out_size = info->members[i1].size;
+ 
+                     return 0;
+                 }
+@@ -255,16 +255,18 @@ EXPORT_SYMBOL(sukisu_super_access);
+ int sukisu_super_container_of(const char *struct_name, const char *member_name,
+                               void *ptr, void **out_ptr)
+ {
++    size_t i, i1;
++
+     if (ptr == NULL)
+         return -3;
+ 
+-    for (size_t i = 0;
++    for (i = 0;
+          i < (sizeof(dynamic_struct_infos) / sizeof(dynamic_struct_infos[0]));
+          i++) {
+         struct DynamicStructInfo *info = dynamic_struct_infos[i];
+ 
+         if (strcmp(struct_name, info->name) == 0) {
+-            for (size_t i1 = 0; i1 < info->count; i1++) {
++            for (i1 = 0; i1 < info->count; i1++) {
+                 if (strcmp(info->members[i1].name, member_name) == 0) {
+                     *out_ptr = (void *)DYNAMIC_CONTAINER_OF(
+                         info->members[i1].offset, ptr);
+diff --git a/kernel/manager/apk_sign.c b/kernel/manager/apk_sign.c
+index d2a6d4b7..9c496244 100644
+--- a/kernel/manager/apk_sign.c
++++ b/kernel/manager/apk_sign.c
+@@ -96,7 +96,7 @@ static bool check_block(struct file *fp, u32 *size4, loff_t *pos, u32 *offset)
+         }
+         kernel_read(fp, cert, *size4, pos);
+         unsigned char digest[SHA256_DIGEST_SIZE];
+-        if (IS_ERR(ksu_sha256(cert, *size4, digest))) {
++        if (ksu_sha256(cert, *size4, digest) < 0) {
+             pr_info("sha256 error\n");
+             return false;
+         }
+diff --git a/kernel/policy/allowlist.c b/kernel/policy/allowlist.c
+index fa32ac15..fb7b42ce 100644
+--- a/kernel/policy/allowlist.c
++++ b/kernel/policy/allowlist.c
+@@ -448,7 +448,7 @@ static void migrate_profile(u32 version, struct app_profile *profile)
+                 pr_info("migrated domain of profile: %s\n", profile->key);
+             }
+         }
+-        fallthrough;
++        /* fall through */
+     case 3:
+         if (profile->allow_su) {
+             profile->rp_config.profile.flags = FLAG_KSU_NO_NEW_PRIVS;
+@@ -576,4 +576,4 @@ void __exit ksu_allowlist_exit(void)
+         put_perm_data(np);
+     }
+     mutex_unlock(&allowlist_mutex);
+-}
+\ No newline at end of file
++}
+diff --git a/kernel/runtime/ksud.c b/kernel/runtime/ksud.c
+index c9d11dac..ee0ee759 100644
+--- a/kernel/runtime/ksud.c
++++ b/kernel/runtime/ksud.c
+@@ -61,7 +61,9 @@ void on_post_fs_data(void)
+ #else
+     stop_input_hook();
+ #endif
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+     ksu_selinux_hide_handle_post_fs_data();
++#endif
+ }
+ 
+ extern void ext4_unregister_sysfs(struct super_block *sb);
+@@ -223,7 +225,9 @@ int ksu_handle_execveat_ksud(int *fd, struct filename **filename_ptr,
+             char buf[16];
+             if (check_argv(*argv, 1, "second_stage", buf, sizeof(buf))) {
+                 pr_info("/system/bin/init second_stage executed\n");
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+                 ksu_selinux_hide_handle_second_stage();
++#endif
+                 apply_kernelsu_rules();
+                 cache_sid();
+                 setup_ksu_cred();
+@@ -295,7 +299,9 @@ int ksu_handle_execveat_ksud(int *fd, struct filename **filename_ptr, struct use
+         char buf[16];
+         if (!init_second_stage_executed && check_argv(*argv, 1, "second_stage", buf, sizeof(buf))) {
+             pr_info("/system/bin/init second_stage executed\n");
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+             ksu_selinux_hide_handle_second_stage();
++#endif
+             apply_kernelsu_rules();
+             cache_sid();
+             setup_ksu_cred();
+diff --git a/kernel/selinux/selinux.c b/kernel/selinux/selinux.c
+index 1f8fd0e9..77fa9ff9 100644
+--- a/kernel/selinux/selinux.c
++++ b/kernel/selinux/selinux.c
+@@ -294,20 +294,27 @@ u32 susfs_get_sid_from_name(const char *secctx_name)
+     return out_sid;
+ }
+ 
++static u32 susfs_current_sid_compat(void)
++{
++    const struct task_security_struct *tsec = selinux_cred(current_cred());
++
++    return tsec ? tsec->sid : 0;
++}
++
+ u32 susfs_get_current_sid(void) {
+-    return current_sid();
++    return susfs_current_sid_compat();
+ }
+ 
+ bool susfs_is_current_zygote_domain(void) {
+-    return unlikely(current_sid() == susfs_zygote_sid);
++    return unlikely(susfs_current_sid_compat() == susfs_zygote_sid);
+ }
+ 
+ bool susfs_is_current_ksu_domain(void) {
+-    return unlikely(current_sid() == susfs_ksu_sid);
++    return unlikely(susfs_current_sid_compat() == susfs_ksu_sid);
+ }
+ 
+ bool susfs_is_current_init_domain(void) {
+-    return unlikely(current_sid() == susfs_init_sid);
++    return unlikely(susfs_current_sid_compat() == susfs_init_sid);
+ }
+ 
+ void susfs_set_batch_sid(void)
+@@ -317,4 +324,4 @@ void susfs_set_batch_sid(void)
+     susfs_set_sid(KERNEL_INIT_DOMAIN, &susfs_init_sid);
+     susfs_set_sid(KERNEL_PRIV_APP_DOMAIN, &susfs_priv_app_sid);
+ }
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/kernel/selinux/sepolicy.c b/kernel/selinux/sepolicy.c
+index 29347784..deee78b2 100644
+--- a/kernel/selinux/sepolicy.c
++++ b/kernel/selinux/sepolicy.c
+@@ -146,7 +146,7 @@ static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)
+     for (i = 0; i < db->te_avtab.nslot; i++) {
+         prev = NULL;
+         // https://github.com/torvalds/linux/commit/acdf52d97f824019888422842757013b37441dd1
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0) || defined(CONFIG_IS_HW_HISI)
+         for (n = db->te_avtab.htable[i]; n; prev = n, n = n->next) {
+             if (n != node)
+                 continue;
+@@ -704,7 +704,8 @@ static bool add_type(struct policydb *db, const char *type_name, bool attr)
+         return false;
+     }
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0) || defined(KSU_TYPE_VAL_TO_STRUCT)
++#if !defined(CONFIG_IS_HW_HISI) &&                                                                         \
++    (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0) || defined(KSU_TYPE_VAL_TO_STRUCT))
+     struct ebitmap *new_type_attr_map_array =
+         ksu_kvrealloc(db->type_attr_map_array, value * sizeof(struct ebitmap), (value - 1) * sizeof(struct ebitmap));
+ 
+@@ -745,7 +746,7 @@ static bool add_type(struct policydb *db, const char *type_name, bool attr)
+ 
+     return true;
+ 
+-#elif defined(KSU_TYPE_VAL_TO_STRUCT_ARRAY)
++#elif !defined(CONFIG_IS_HW_HISI) && defined(KSU_TYPE_VAL_TO_STRUCT_ARRAY)
+     struct ebitmap *new_type_attr_map_array =
+         ksu_kvrealloc(db->type_attr_map_array, value * sizeof(struct ebitmap), (value - 1) * sizeof(struct ebitmap));
+ 
+@@ -960,14 +961,15 @@ static bool set_type_state(struct policydb *db, const char *type_name, bool perm
+ 
+ static void add_typeattribute_raw(struct policydb *db, struct type_datum *type, struct type_datum *attr)
+ {
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0) || defined(KSU_TYPE_VAL_TO_STRUCT) ||                                \
+-    defined(KSU_TYPE_VAL_TO_STRUCT_ARRAY)
++#if !defined(CONFIG_IS_HW_HISI) &&                                                                         \
++    (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0) || defined(KSU_TYPE_VAL_TO_STRUCT) ||                   \
++     defined(KSU_TYPE_VAL_TO_STRUCT_ARRAY))
+     struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];
+ #elif defined(CONFIG_IS_HW_HISI)
+     /*
+    *   HISI_SELINUX_EBITMAP_RO is Huawei's unique features.
+    */
+-    struct ebitmap *sattr = &db->type_attr_map[type->value - 1], HISI_SELINUX_EBITMAP_RO;
++    struct ebitmap *sattr = &db->type_attr_map[type->value - 1];
+ #else
+     struct ebitmap *sattr = flex_array_get(db->type_attr_map_array, type->value - 1);
+ #endif
+diff --git a/kernel/sulog/event.c b/kernel/sulog/event.c
+index e45f01fa..4547911d 100644
+--- a/kernel/sulog/event.c
++++ b/kernel/sulog/event.c
+@@ -141,8 +141,8 @@ static __u32 ksu_sulog_flatten_argv(struct user_arg_ptr *argv_user, char *dst, _
+         if (IS_ERR(arg_user))
+             return ksu_sulog_copy_empty_string(dst);
+ 
+-        copied =
+-            strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));
++        copied = ksu_strncpy_from_user_nofault(
++            arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));
+         if (copied <= 0)
+             return ksu_sulog_copy_empty_string(dst);
+ 
+@@ -373,10 +373,12 @@ static struct ksu_sulog_pending_event *ksu_sulog_capture_grant_root(const struct
+     struct ksu_sulog_pending_event *pending;
+     struct ksu_sulog_event *event;
+ 
+-    // This is actually stupid fix
+-    #define USER_ARG_NULL user_arg_null_ptr()
+-
+-    pending = ksu_sulog_capture(KSU_SULOG_EVENT_IOCTL_GRANT_ROOT, NULL, USER_ARG_NULL, gfp);
++    pending = ksu_sulog_capture(KSU_SULOG_EVENT_IOCTL_GRANT_ROOT, NULL,
++#ifdef CONFIG_KSU_SUSFS
++                                user_arg_null_ptr(), gfp);
++#else
++                                *user_arg_null_ptr(), gfp);
++#endif
+     if (!pending)
+         return NULL;
+ 
+diff --git a/kernel/supercall/dispatch.c b/kernel/supercall/dispatch.c
+index c1d3abaf..27e77c35 100644
+--- a/kernel/supercall/dispatch.c
++++ b/kernel/supercall/dispatch.c
+@@ -1,3 +1,7 @@
++#ifdef CONFIG_KSU_SUSFS
++#include <linux/susfs_ksu_compat.h>
++#endif
++
+ static int do_grant_root(void __user *arg)
+ {
+     int ret;
+@@ -486,7 +490,9 @@ static int do_nuke_ext4_sysfs(void __user *arg)
+ 
+     memset(mnt, 0, sizeof(mnt));
+ 
+-    ret = ksu_strncpy_from_user_nofault(mnt, cmd.arg, sizeof(mnt));
++    ret = ksu_strncpy_from_user_nofault(mnt,
++                                        (const void __user *)(unsigned long)cmd.arg,
++                                        sizeof(mnt));
+     if (ret < 0) {
+         pr_err("nuke ext4 copy mnt failed: %ld\n", ret);
+         return -EFAULT;
+@@ -1036,3 +1042,22 @@ void __init ksu_supercall_dump_commands(void)
+ void ksu_supercall_cleanup_state(void)
+ {
+ }
++
++/* dispatch.c is part of a unity build; do not leak v2 compatibility macros. */
++#ifdef CONFIG_KSU_SUSFS
++#undef susfs_add_sus_path
++#undef susfs_add_sus_path_loop
++#undef susfs_set_hide_sus_mnts_for_non_su_procs
++#undef susfs_add_sus_kstat
++#undef susfs_update_sus_kstat
++#undef susfs_set_uname
++#undef susfs_enable_log
++#undef susfs_set_cmdline_or_bootconfig
++#undef susfs_add_open_redirect
++#undef susfs_add_sus_map
++#undef susfs_set_avc_log_spoofing
++#undef susfs_get_enabled_features
++#undef susfs_show_variant
++#undef susfs_show_version
++#undef susfs_start_sdcard_monitor_fn
++#endif
+diff --git a/kernel/kpm_map_area.S b/kernel/kpm_map_area.S
+new file mode 100644
+index 00000000..c42cbc87
+--- /dev/null
++++ b/kernel/kpm_map_area.S
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++/*
++ * Dedicated early executable scratch area for KernelPatch.  The generic
++ * non-GKI patcher otherwise borrows tcp_init_sock and must restore it before
++ * networking starts.  Keeping a private area makes staged bring-up safe and
++ * avoids overwriting a live kernel function.
++ */
++
++	.section ".text.kpm_map_area", "ax"
++	.balign 0x800
++	.global kpm_early_map_area
++	.type kpm_early_map_area, %function
++kpm_early_map_area:
++	.space 0x800, 0
++	.size kpm_early_map_area, . - kpm_early_map_area

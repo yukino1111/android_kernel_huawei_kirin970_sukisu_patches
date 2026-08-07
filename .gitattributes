@@ -1,0 +1,9 @@
+* -text
+# Unified diffs necessarily contain context-marker whitespace.  Do not treat
+# that embedded source whitespace as whitespace damage to the archive itself.
+*.patch diff -whitespace
+*.log diff -whitespace
+*.md diff
+*.sh diff
+*.config diff
+*.tsv diff

@@ -1,0 +1,1358 @@
+diff --git a/kernel/Makefile b/kernel/Makefile
+index df23ebd..1b1d0b2 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -13,6 +13,7 @@ CFLAGS += -Wall -fno-builtin -std=gnu11 -nostdinc -mgeneral-regs-only
+ CFLAGS += -g
+ CFLAGS += -Wno-unused-function -Wno-return-type -Wno-c23-extensions -Wno-uninitialized
+ CFLAGS += -fno-PIC -fno-asynchronous-unwind-tables -fno-stack-protector -fno-unwind-tables -fno-semantic-interposition -U_FORTIFY_SOURCE -fno-common
++CFLAGS += $(PAR_CFLAGS)
+ 
+ ifdef DEBUG
+ 	CFLAGS += -DDEBUG -DMAP_DEBUG -g
+diff --git a/kernel/base/cache.S b/kernel/base/cache.S
+index cd7f0eb..c765fd8 100644
+--- a/kernel/base/cache.S
++++ b/kernel/base/cache.S
+@@ -116,7 +116,7 @@ ENDPROC(__flush_dcache_all)
+  *	unification in a single instruction.
+  */
+ ENTRY(flush_cache_all)
+-	mov	x12, lr
++	mov	x12, x30
+ 	bl	__flush_dcache_all
+ 	mov	x0, #0
+ 	ic	ialluis				// I+BTB cache invalidate
+@@ -287,4 +287,4 @@ ENTRY(__dma_unmap_area)
+ 	cmp	w2, #DMA_TO_DEVICE
+ 	b.ne	__dma_inv_range
+ 	ret
+-ENDPROC(__dma_unmap_area)
+\ No newline at end of file
++ENDPROC(__dma_unmap_area)
+diff --git a/kernel/base/fphook.c b/kernel/base/fphook.c
+index 5c37ca3..17126d5 100644
+--- a/kernel/base/fphook.c
++++ b/kernel/base/fphook.c
+@@ -252,7 +252,7 @@ hook_err_t fp_hook_wrap(uintptr_t fp_addr, int32_t argno, void *before, void *af
+         chain = (fp_hook_chain_t *)hook_mem_zalloc(fp_addr, FUNCTION_POINTER_CHAIN);
+         if (!chain) return -HOOK_NO_MEM;
+         chain->hook.fp_addr = fp_addr;
+-        chain->hook.replace_addr = (uint64_t)chain->transit;
++        chain->hook.replace_addr = (uint64_t)hook_mem_to_exec(chain->transit);
+         err = hook_chain_prepare(chain->transit, argno);
+         if (err) return err;
+         flush_icache_all();
+@@ -311,4 +311,4 @@ void fp_hook_unwrap(uintptr_t fp_addr, void *before, void *after)
+     hook_mem_free(chain);
+     logkv("Unwrap func pointer: %llx, %llx, %llx\n", fp_addr, before, after);
+ }
+-KP_EXPORT_SYMBOL(fp_hook_unwrap);
+\ No newline at end of file
++KP_EXPORT_SYMBOL(fp_hook_unwrap);
+diff --git a/kernel/base/hmem.c b/kernel/base/hmem.c
+index 64ec496..f785fa9 100644
+--- a/kernel/base/hmem.c
++++ b/kernel/base/hmem.c
+@@ -6,9 +6,14 @@
+ #include "hook.h"
+ 
+ #include <stdint.h>
++#include <pgtable.h>
+ 
+ static uint64_t mem_region_start = 0;
+ static uint64_t mem_region_end = 0;
++#ifdef PAR_WX_DUAL_ALIAS
++static uint64_t mem_region_exec_start = 0;
++static uint64_t mem_region_exec_end = 0;
++#endif
+ 
+ typedef struct
+ {
+@@ -26,6 +31,11 @@ typedef struct
+ 
+ int hook_mem_add(uint64_t start, int32_t size)
+ {
++#ifdef PAR_WX_DUAL_ALIAS
++    mem_region_exec_start = start;
++    mem_region_exec_end = start + size;
++    start = phys_to_virt(kp_kimg_to_phys(start));
++#endif
+     for (uint64_t i = start; i < start + size; i += 8) {
+         *(uint64_t *)i = 0;
+     }
+@@ -34,6 +44,26 @@ int hook_mem_add(uint64_t start, int32_t size)
+     return 0;
+ }
+ 
++void *hook_mem_to_exec(void *hook_mem)
++{
++#ifdef PAR_WX_DUAL_ALIAS
++    uint64_t addr = (uint64_t)hook_mem;
++    if (addr >= mem_region_start && addr < mem_region_end)
++        return (void *)(mem_region_exec_start + addr - mem_region_start);
++#endif
++    return hook_mem;
++}
++
++void *hook_mem_to_rw(void *hook_mem)
++{
++#ifdef PAR_WX_DUAL_ALIAS
++    uint64_t addr = (uint64_t)hook_mem;
++    if (addr >= mem_region_exec_start && addr < mem_region_exec_end)
++        return (void *)(mem_region_start + addr - mem_region_exec_start);
++#endif
++    return hook_mem;
++}
++
+ void *hook_mem_zalloc(uintptr_t origin_addr, enum hook_type type)
+ {
+     uint64_t start = mem_region_start;
+diff --git a/kernel/base/hmem.h b/kernel/base/hmem.h
+index 0ffe448..2ddd161 100644
+--- a/kernel/base/hmem.h
++++ b/kernel/base/hmem.h
+@@ -12,5 +12,7 @@ int hook_mem_add(uint64_t start, int32_t size);
+ void *hook_mem_zalloc(uintptr_t origin_addr, enum hook_type type);
+ void hook_mem_free(void *hook_mem);
+ void *hook_get_mem_from_origin(uint64_t origin_addr);
++void *hook_mem_to_exec(void *hook_mem);
++void *hook_mem_to_rw(void *hook_mem);
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/kernel/base/hook.c b/kernel/base/hook.c
+index 38d9c80..94ae450 100644
+--- a/kernel/base/hook.c
++++ b/kernel/base/hook.c
+@@ -645,7 +645,7 @@ hook_err_t hook(void *func, void *replace, void **backup)
+     hook->func_addr = (uint64_t)func;
+     hook->origin_addr = origin_addr;
+     hook->replace_addr = (uint64_t)replace;
+-    hook->relo_addr = (uint64_t)hook->relo_insts;
++    hook->relo_addr = (uint64_t)hook_mem_to_exec(hook->relo_insts);
+     *backup = (void *)hook->relo_addr;
+     logkv("Hook func: %llx, origin: %llx, replace: %llx, relocate: %llx, chain: %llx\n", hook->func_addr,
+           hook->origin_addr, hook->replace_addr, hook->relo_addr, hook);
+@@ -772,8 +772,8 @@ hook_err_t hook_wrap(void *func, int32_t argno, void *before, void *after, void
+     hook_t *hook = &chain->hook;
+     hook->func_addr = faddr;
+     hook->origin_addr = origin;
+-    hook->replace_addr = (uint64_t)chain->transit;
+-    hook->relo_addr = (uint64_t)hook->relo_insts;
++    hook->replace_addr = (uint64_t)hook_mem_to_exec(chain->transit);
++    hook->relo_addr = (uint64_t)hook_mem_to_exec(hook->relo_insts);
+     logkv("Wrap func: %llx, origin: %llx, replace: %llx, relocate: %llx, chain: %llx\n", hook->func_addr,
+           hook->origin_addr, hook->replace_addr, hook->relo_addr, chain);
+     hook_err_t err = hook_prepare(hook);
+diff --git a/kernel/base/map.c b/kernel/base/map.c
+index 80cbb4b..3925942 100644
+--- a/kernel/base/map.c
++++ b/kernel/base/map.c
+@@ -66,6 +66,30 @@ static void flush_icache_all(void)
+     asm volatile("isb" : : : "memory");
+ }
+ 
++static void sync_icache_range(uint64_t start, uint64_t end)
++{
++    uint64_t ctr_el0;
++    uint64_t line_size;
++    uint64_t addr;
++
++    asm volatile("mrs %0, ctr_el0" : "=r"(ctr_el0));
++
++    line_size = 4u << ((ctr_el0 >> 16) & 0xf);
++    addr = start & ~(line_size - 1);
++    for (; addr < end; addr += line_size)
++        asm volatile("dc cvau, %0" : : "r"(addr) : "memory");
++
++    asm volatile("dsb ish" : : : "memory");
++
++    line_size = 4u << (ctr_el0 & 0xf);
++    addr = start & ~(line_size - 1);
++    for (; addr < end; addr += line_size)
++        asm volatile("ic ivau, %0" : : "r"(addr) : "memory");
++
++    asm volatile("dsb ish" : : : "memory");
++    asm volatile("isb" : : : "memory");
++}
++
+ static __noinline void mem_proc(map_data_t *data)
+ {
+ 	*data = *get_data();
+@@ -100,11 +124,33 @@ static __noinline void mem_proc(map_data_t *data)
+     data->page_shift = page_shift;
+ 
+     // linear
+-    uint64_t detect_phys =
+-        ((memblock_phys_alloc_try_nid_f)data->map_symbol.memblock_phys_alloc_relo)(0, 0x10, NUMA_NO_NODE);
+-    uint64_t detect_virt = (uint64_t)((memblock_virt_alloc_try_nid_f)data->map_symbol.memblock_virt_alloc_relo)(
+-        0, 0x10, detect_phys, detect_phys, NUMA_NO_NODE);
+-    data->linear_voffset = detect_virt - detect_phys;
++ #ifdef PAR_USE_NATIVE_LINEAR_DETECT
++    {
++        uint64_t detect_phys =
++            ((memblock_phys_alloc_try_nid_f)data->map_symbol.memblock_phys_alloc_relo)(
++                0, 0x10, NUMA_NO_NODE);
++        uint64_t detect_virt =
++            (uint64_t)((memblock_virt_alloc_try_nid_f)data->map_symbol.memblock_virt_alloc_relo)(
++                0, 0x10, detect_phys, detect_phys, NUMA_NO_NODE);
++        data->linear_voffset = detect_virt - detect_phys;
++    }
++#else
++    if (data->map_symbol.memstart_addr_relo) {
++#ifdef PAR_FORCE_PAGE_OFFSET_39
++        uint64_t page_offset = 0xffffffc000000000ull;
++#else
++        uint64_t page_offset = (~(uint64_t)0) << (va1_bits - 1);
++#endif
++        int64_t memstart_addr = *(int64_t *)data->map_symbol.memstart_addr_relo;
++        data->linear_voffset = page_offset - memstart_addr;
++    } else {
++        uint64_t detect_phys =
++            ((memblock_phys_alloc_try_nid_f)data->map_symbol.memblock_phys_alloc_relo)(0, 0x10, NUMA_NO_NODE);
++        uint64_t detect_virt = (uint64_t)((memblock_virt_alloc_try_nid_f)data->map_symbol.memblock_virt_alloc_relo)(
++            0, 0x10, detect_phys, detect_phys, NUMA_NO_NODE);
++        data->linear_voffset = detect_virt - detect_phys;
++    }
++#endif
+ }
+ 
+ // todo: 52-bits pa
+@@ -173,6 +219,203 @@ static uint64_t __noinline get_or_create_pte(map_data_t *data, uint64_t va, uint
+ // todo: bti
+ void __noinline _paging_init()
+ {
++#ifdef PAR_DIAG_POSTPAGING_LINEARCOPY_VERIFY
++    map_data_t linearcopy_probe_buf;
++    map_data_t *linearcopy_probe_data = &linearcopy_probe_buf;
++    uint64_t linearcopy_page_size;
++    uint64_t linearcopy_old_start_pa;
++    uint64_t linearcopy_reserve_size;
++    uint64_t linearcopy_align_extra_size;
++    uint64_t linearcopy_all_size;
++    uint64_t linearcopy_start_pa;
++    uint64_t linearcopy_old_start_va;
++    uint64_t linearcopy_start_va;
++
++    mem_proc(linearcopy_probe_data);
++    linearcopy_page_size = 1ull << linearcopy_probe_data->page_shift;
++    linearcopy_old_start_pa = linearcopy_probe_data->kernel_pa +
++                              linearcopy_probe_data->start_offset;
++    linearcopy_reserve_size = linearcopy_probe_data->start_img_size +
++                              linearcopy_probe_data->extra_size;
++    linearcopy_align_extra_size =
++        (linearcopy_probe_data->extra_size + linearcopy_page_size - 1) &
++        ~(linearcopy_page_size - 1);
++    linearcopy_all_size = linearcopy_probe_data->start_size +
++                          linearcopy_align_extra_size +
++                          linearcopy_probe_data->alloc_size;
++
++    ((memblock_reserve_f)linearcopy_probe_data->map_symbol.memblock_reserve_relo)(
++        linearcopy_old_start_pa, linearcopy_reserve_size);
++    linearcopy_start_pa =
++        ((memblock_phys_alloc_try_nid_f)linearcopy_probe_data->map_symbol.memblock_phys_alloc_relo)(
++            linearcopy_all_size, linearcopy_page_size, 0);
++
++    *(uint32_t *)linearcopy_probe_data->paging_init_relo =
++        linearcopy_probe_data->paging_init_backup;
++    flush_icache_all();
++    ((paging_init_f)linearcopy_probe_data->paging_init_relo)();
++
++    linearcopy_old_start_va = phys_to_lm(linearcopy_probe_data,
++                                          linearcopy_old_start_pa);
++    linearcopy_start_va = phys_to_lm(linearcopy_probe_data,
++                                     linearcopy_start_pa);
++    for (uint64_t i = 0; i < linearcopy_all_size; i += 8)
++        *(uint64_t *)(linearcopy_start_va + i) = 0;
++    for (uint64_t i = 0; i < linearcopy_probe_data->start_img_size; i += 8)
++        *(uint64_t *)(linearcopy_start_va + i) =
++            *(uint64_t *)(linearcopy_old_start_va + i);
++
++    if (*(uint64_t *)linearcopy_start_va == 0xd65f03c052800000ull)
++        return;
++    for (;;)
++        asm volatile("wfe");
++#endif
++
++#ifdef PAR_DIAG_POSTPAGING_SOURCE_VERIFY
++    map_data_t source_probe_buf;
++    map_data_t *source_probe_data = &source_probe_buf;
++    uint64_t source_probe_old_start_pa;
++    uint64_t source_probe_reserve_size;
++    uint64_t source_probe_old_start_va;
++
++    mem_proc(source_probe_data);
++    source_probe_old_start_pa = source_probe_data->kernel_pa +
++                                source_probe_data->start_offset;
++    source_probe_reserve_size = source_probe_data->start_img_size +
++                                source_probe_data->extra_size;
++    ((memblock_reserve_f)source_probe_data->map_symbol.memblock_reserve_relo)(
++        source_probe_old_start_pa, source_probe_reserve_size);
++
++    *(uint32_t *)source_probe_data->paging_init_relo =
++        source_probe_data->paging_init_backup;
++    flush_icache_all();
++    ((paging_init_f)source_probe_data->paging_init_relo)();
++
++    source_probe_old_start_va = phys_to_lm(source_probe_data,
++                                            source_probe_old_start_pa);
++    if (*(uint64_t *)source_probe_old_start_va ==
++        0xd65f03c052800000ull)
++        return;
++    for (;;)
++        asm volatile("wfe");
++#endif
++
++#ifdef PAR_DIAG_POSTPAGING_LINEAR_ALIAS_VERIFY
++    map_data_t postpaging_probe_buf;
++    map_data_t *postpaging_probe_data = &postpaging_probe_buf;
++    uint64_t postpaging_probe_kernel_va;
++    uint64_t postpaging_probe_alias_va;
++
++    mem_proc(postpaging_probe_data);
++    *(uint32_t *)postpaging_probe_data->paging_init_relo =
++        postpaging_probe_data->paging_init_backup;
++    flush_icache_all();
++    ((paging_init_f)postpaging_probe_data->paging_init_relo)();
++
++    postpaging_probe_kernel_va = get_kva();
++    postpaging_probe_alias_va = phys_to_lm(postpaging_probe_data,
++                                           postpaging_probe_data->kernel_pa);
++    if (*(uint64_t *)postpaging_probe_kernel_va ==
++        *(uint64_t *)postpaging_probe_alias_va)
++        return;
++    for (;;)
++        asm volatile("wfe");
++#endif
++
++#ifdef PAR_DIAG_LINEAR_ALIAS_VERIFY
++    map_data_t linear_probe_buf;
++    map_data_t *linear_probe_data = &linear_probe_buf;
++    uint64_t linear_probe_kernel_va;
++    uint64_t linear_probe_alias_va;
++
++    mem_proc(linear_probe_data);
++    linear_probe_kernel_va = get_kva();
++    linear_probe_alias_va = phys_to_lm(linear_probe_data,
++                                       linear_probe_data->kernel_pa);
++    if (*(uint64_t *)linear_probe_kernel_va ==
++        *(uint64_t *)linear_probe_alias_va) {
++        *(uint32_t *)linear_probe_data->paging_init_relo =
++            linear_probe_data->paging_init_backup;
++        flush_icache_all();
++        ((paging_init_f)linear_probe_data->paging_init_relo)();
++        return;
++    }
++    for (;;)
++        asm volatile("wfe");
++#endif
++
++#ifdef PAR_DIAG_EARLY_COPY_VERIFY
++    map_data_t *early_probe_data = get_data();
++    uint64_t early_probe_kernel_va = get_kva();
++    uint64_t early_probe_paging_init_va =
++        early_probe_data->paging_init_relo + early_probe_kernel_va;
++
++    if (early_probe_data->early_copy_magic == 1) {
++        *(uint32_t *)early_probe_paging_init_va =
++            early_probe_data->paging_init_backup;
++        flush_icache_all();
++        ((paging_init_f)early_probe_paging_init_va)();
++        return;
++    }
++    for (;;)
++        asm volatile("wfe");
++#endif
++
++#ifdef PAR_DIAG_PAGING_PASSTHROUGH
++    map_data_t *probe_data = get_data();
++    uint64_t probe_kernel_va = get_kva();
++    uint64_t probe_paging_init_va = probe_data->paging_init_relo + probe_kernel_va;
++
++    *(uint32_t *)probe_paging_init_va = probe_data->paging_init_backup;
++    flush_icache_all();
++    ((paging_init_f)probe_paging_init_va)();
++    return;
++#endif
++
++#ifdef PAR_DIAG_MEMPROC_PASSTHROUGH
++    map_data_t probe_buf;
++    map_data_t *probe_data = &probe_buf;
++
++    mem_proc(probe_data);
++    *(uint32_t *)probe_data->paging_init_relo = probe_data->paging_init_backup;
++    flush_icache_all();
++    ((paging_init_f)probe_data->paging_init_relo)();
++    return;
++#endif
++
++#ifdef PAR_DIAG_PREPAGING_PASSTHROUGH
++    map_data_t probe_buf;
++    map_data_t *probe_data = &probe_buf;
++    uint64_t probe_page_size;
++    uint64_t probe_old_start_pa;
++    uint64_t probe_reserve_size;
++    uint64_t probe_align_extra_size;
++    uint64_t probe_all_size;
++    uint64_t probe_start_pa;
++
++    mem_proc(probe_data);
++    probe_page_size = 1 << probe_data->page_shift;
++    probe_old_start_pa = probe_data->start_offset + probe_data->kernel_pa;
++    probe_reserve_size = probe_data->start_img_size + probe_data->extra_size;
++    probe_align_extra_size =
++        (probe_data->extra_size + probe_page_size - 1) & ~(probe_page_size - 1);
++    probe_all_size = probe_data->start_size + probe_align_extra_size + probe_data->alloc_size;
++
++    ((memblock_reserve_f)probe_data->map_symbol.memblock_reserve_relo)(
++        probe_old_start_pa, probe_reserve_size);
++    probe_start_pa =
++        ((memblock_phys_alloc_try_nid_f)probe_data->map_symbol.memblock_phys_alloc_relo)(
++            probe_all_size, probe_page_size, 0);
++    if (probe_data->map_symbol.memblock_mark_nomap_relo)
++        ((memblock_mark_nomap_f)probe_data->map_symbol.memblock_mark_nomap_relo)(
++            probe_start_pa, probe_all_size);
++
++    *(uint32_t *)probe_data->paging_init_relo = probe_data->paging_init_backup;
++    flush_icache_all();
++    ((paging_init_f)probe_data->paging_init_relo)();
++    return;
++#endif
++
+ 	map_data_t buf;
+ 	map_data_t *data = &buf;
+     mem_proc(data);
+@@ -199,8 +442,10 @@ void __noinline _paging_init()
+     uint64_t start_pa =
+         ((memblock_phys_alloc_try_nid_f)data->map_symbol.memblock_phys_alloc_relo)(all_size, page_size, 0);
+     // mark all size nomap
++#if !defined(PAR_DIAG_LINEAR_START_EXEC) && !defined(PAR_WX_DUAL_ALIAS)
+     if (data->map_symbol.memblock_mark_nomap_relo)
+         ((memblock_mark_nomap_f)(data->map_symbol.memblock_mark_nomap_relo))(start_pa, all_size);
++#endif
+ 
+     // paging_init
+     uint64_t paging_init_va = data->paging_init_relo;
+@@ -218,14 +463,28 @@ void __noinline _paging_init()
+     // todo: restore wxn later
+     uint64_t sctlr_el1 = 0;
+     asm volatile("mrs %[reg], sctlr_el1" : [reg] "+r"(sctlr_el1));
++#if defined(PAR_DIAG_POSTMAP_PASSTHROUGH) || defined(PAR_DIAG_POSTCOPY_PASSTHROUGH) || \
++    defined(PAR_DIAG_POSTFREE_PASSTHROUGH)
++    uint64_t probe_sctlr_el1 = sctlr_el1;
++#endif
++#ifndef PAR_DIAG_ROX_START_EXEC
+     sctlr_el1 &= 0xFFFFFFFFFFF7FFFF;
+     asm volatile("msr sctlr_el1, %[reg]" : : [reg] "r"(sctlr_el1));
++#endif
+ 
+     // move start memory
++#ifdef PAR_DIRECT_KPIMG_SOURCE
++    uint64_t old_start_va = old_start_pa + data->kimage_voffset;
++#else
+     uint64_t old_start_va = phys_to_lm(data, old_start_pa);
++#endif
+ 
+     // uint64_t vm_gurad_enough = page_size << 3;
++#ifdef PAR_DIAG_LINEAR_START_EXEC
++    uint64_t start_va = phys_to_lm(data, start_pa);
++#else
+     uint64_t start_va = start_pa + data->kimage_voffset;
++#endif
+ 
+     for (uint64_t off = 0; off < all_size; off += page_size) {
+         uint64_t entry = get_or_create_pte(data, start_va + off, start_pa + off, attr_indx);
+@@ -233,6 +492,12 @@ void __noinline _paging_init()
+     }
+     flush_tlb_all();
+ 
++#ifdef PAR_DIAG_POSTMAP_PASSTHROUGH
++    asm volatile("msr sctlr_el1, %[reg]" : : [reg] "r"(probe_sctlr_el1));
++    asm volatile("isb" : : : "memory");
++    return;
++#endif
++
+     for (uint64_t i = start_va; i < start_va + all_size; i += 8) {
+         *(uint64_t *)i = 0;
+     }
+@@ -243,13 +508,87 @@ void __noinline _paging_init()
+         *(uint64_t *)(start_va + data->start_size + i) = *(uint64_t *)(old_start_va + data->start_img_size + i);
+     }
+ 
+-    flush_icache_all();
++    sync_icache_range(start_va, start_va + data->start_img_size);
++
++#ifdef PAR_DIAG_ROX_START_EXEC
++    /*
++     * Keep SCTLR.WXN enabled and make copied code read-only and executable
++     * after copying.  The linker places .kp.data 0x20000 bytes after the
++     * start entry, so PAR_ROX_FULL_TEXT_EXEC can cover every .kp.text page
++     * (plus alignment padding) without changing the data mapping.
++     */
++    {
++        uint64_t rox_size = page_size;
++#ifdef PAR_ROX_FULL_TEXT_EXEC
++        rox_size = 0x20000;
++#endif
++        for (uint64_t off = 0; off < rox_size; off += page_size) {
++            uint64_t entry = get_or_create_pte(data, start_va + off,
++                                               start_pa + off, attr_indx);
++            uint64_t value = *(uint64_t *)entry;
++
++            value |= (1ull << 7);       /* PTE_RDONLY */
++            value &= ~(1ull << 51);     /* PTE_DBM / writable */
++            value &= ~(1ull << 53);     /* PTE_PXN */
++            value &= ~(1ull << 50);     /* PTE_GP */
++            *(uint64_t *)entry = value;
++        }
++        flush_tlb_all();
++        sync_icache_range(start_va, start_va + rox_size);
++    }
++#endif
++
++#ifdef PAR_DIAG_VERIFY_OLD_START_COPY
++    if (*(uint64_t *)old_start_va == 0xd65f03c052800000ull) {
++        uint64_t probe_old_copy_sctlr_el1;
++
++        asm volatile("mrs %0, sctlr_el1" : "=r"(probe_old_copy_sctlr_el1));
++        probe_old_copy_sctlr_el1 |= 0x80000;
++        asm volatile("msr sctlr_el1, %0" : : "r"(probe_old_copy_sctlr_el1));
++        asm volatile("isb" : : : "memory");
++        return;
++    }
++#endif
++
++#ifdef PAR_DIAG_POSTCOPY_PASSTHROUGH
++    asm volatile("msr sctlr_el1, %[reg]" : : [reg] "r"(probe_sctlr_el1));
++    asm volatile("isb" : : : "memory");
++    return;
++#endif
+ 
+     // free old start
++#ifndef PAR_DIRECT_KPIMG_SOURCE
+     ((memblock_free_f)data->map_symbol.memblock_free_relo)(old_start_pa, reserve_size);
++#endif
++
++#ifdef PAR_DIAG_VERIFY_START_COPY
++    if (*(uint64_t *)start_va == 0xd65f03c052800000ull) {
++        uint64_t probe_copy_sctlr_el1;
++
++        asm volatile("mrs %0, sctlr_el1" : "=r"(probe_copy_sctlr_el1));
++        probe_copy_sctlr_el1 |= 0x80000;
++        asm volatile("msr sctlr_el1, %0" : : "r"(probe_copy_sctlr_el1));
++        asm volatile("isb" : : : "memory");
++        return;
++    }
++#endif
++
++#ifdef PAR_DIAG_POSTFREE_PASSTHROUGH
++    asm volatile("msr sctlr_el1, %[reg]" : : [reg] "r"(probe_sctlr_el1));
++    asm volatile("isb" : : : "memory");
++    return;
++#endif
+ 
+     // start
+     ((start_f)start_va)(data->kimage_voffset, data->linear_voffset);
++#ifdef PAR_DIAG_RESTORE_WXN_AFTER_START
++    uint64_t probe_post_start_sctlr_el1;
++
++    asm volatile("mrs %0, sctlr_el1" : "=r"(probe_post_start_sctlr_el1));
++    probe_post_start_sctlr_el1 |= 0x80000;
++    asm volatile("msr sctlr_el1, %0" : : "r"(probe_post_start_sctlr_el1));
++    asm volatile("isb" : : : "memory");
++#endif
+ }
+ 
+ void *memcpy(void *dst, const void *src, size_t n)
+diff --git a/kernel/base/setup.h b/kernel/base/setup.h
+index c5de937..1b1a57d 100644
+--- a/kernel/base/setup.h
++++ b/kernel/base/setup.h
+@@ -47,6 +47,7 @@ typedef struct
+     int64_t page_shift;
+     uint64_t kimage_voffset;
+     uint64_t linear_voffset;
++    uint64_t early_copy_magic;
+ } map_data_t;
+ #else
+ #define map_paging_init_backup_offset 0
+@@ -64,7 +65,11 @@ typedef struct
+ #define map_tmp0_offset (map_printk_relo_offset + 8)
+ #define map_tmp1_offset (map_tmp0_offset + 8)
+ #define map_str_fmt_px_offset (map_tmp1_offset + 8)
++#define map_local_data_offset (map_str_fmt_px_offset + 24)
++#else
++#define map_local_data_offset (map_map_symbol_offset + MAP_SYMBOL_SIZE)
+ #endif // MAP_DEBUG
++#define map_early_copy_magic_offset (map_local_data_offset + 32)
+ #endif
+ 
+ #ifndef __ASSEMBLY__
+@@ -82,4 +87,4 @@ extern void _map_end();
+ extern void _kp_end();
+ #endif // __ASSEMBLY__
+ 
+-#endif // _KP_SETUP_H_
+\ No newline at end of file
++#endif // _KP_SETUP_H_
+diff --git a/kernel/base/setup1.S b/kernel/base/setup1.S
+index b5489fc..f7a844c 100644
+--- a/kernel/base/setup1.S
++++ b/kernel/base/setup1.S
+@@ -150,6 +150,25 @@ start_prepare:
+     add x2, x2, x22
+     bl rmemcpy32
+ 
++#ifdef PAR_DIAG_EARLY_COPY_VERIFY
++    // Verify the staged empty start() while the kernel still runs with the
++    // physical/idmap view.  This avoids relying on either the linear map or
++    // the kimage alias when diagnosing the first-stage copy.
++    ldr w3, [x0]
++    mov w4, #0
++    movk w4, #0x5280, lsl #16
++    cmp w3, w4
++    b.ne .early_copy_verify_done
++    ldr w3, [x0, #4]
++    mov w4, #0x03c0
++    movk w4, #0xd65f, lsl #16
++    cmp w3, w4
++    b.ne .early_copy_verify_done
++    mov x3, #1
++    str x3, [x9, #map_early_copy_magic_offset]
++.early_copy_verify_done:
++#endif
++
+     // Restore
+     ldp x23, x24, [sp], 16 
+     ldp x21, x22, [sp], 16 
+@@ -197,7 +216,17 @@ map_prepare:
+ #endif
+     // set start memory info
+     // map_data.start_offset = setup_preset.start_offset;
++#ifdef PAR_DIRECT_KPIMG_SOURCE
++    ldr x11, [x10, #setup_setup_offset_offset]
++    adrp x12, _kp_start
++    add x12, x12, :lo12:_kp_start
++    adrp x13, _link_base
++    add x13, x13, :lo12:_link_base
++    sub x12, x12, x13
++    add x11, x11, x12
++#else
+     ldr x11, [x10, #setup_start_offset_offset]
++#endif
+     str x11, [x9, #map_start_offset_offset]
+ 
+     // map_data.start_size = (int64_t)(_kp_end - _kp_start);
+@@ -366,4 +395,4 @@ setup_entry:
+     stp x9, x10, [sp, -16]! 
+     b setup
+ 
+-#undef __ASSEMBLY__
+\ No newline at end of file
++#undef __ASSEMBLY__
+diff --git a/kernel/base/start.c b/kernel/base/start.c
+index df3e39f..30de4fb 100644
+--- a/kernel/base/start.c
++++ b/kernel/base/start.c
+@@ -176,6 +176,61 @@ uint64_t *pgtable_entry(uint64_t pgd, uint64_t va)
+ }
+ KP_EXPORT_SYMBOL(pgtable_entry);
+ 
++void clear_table_exec_kernel(uint64_t va)
++{
++    uint64_t pxd_bits = page_shift - 3;
++    uint64_t pxd_ptrs = 1u << pxd_bits;
++    uint64_t pxd_va = pgd_va;
++
++    /*
++     * A leaf PTE can be ROX while an ancestor table descriptor still has
++     * PXNTable/UXNTable set.  In that case instruction fetches fault even
++     * though a leaf-page dump looks executable.  Walk only the table path
++     * for this VA and let leaf PTEs retain their own W^X permissions.
++     */
++    for (int64_t lv = 4 - page_level; lv < 3; lv++) {
++        uint64_t pxd_shift = pxd_bits * (4 - lv) + 3;
++        uint64_t pxd_index = (va >> pxd_shift) & (pxd_ptrs - 1);
++        uint64_t *entry = (uint64_t *)(pxd_va + pxd_index * sizeof(uint64_t));
++        uint64_t desc = *entry;
++
++        if ((desc & PTE_TYPE_MASK) != PTE_TYPE_PAGE) {
++            log_boot("KPM table L%d is not a table: %llx\n", lv, desc);
++            return;
++        }
++
++        uint64_t exec_desc = desc & ~PTATTR_PXN & ~PTATTR_XN;
++        log_boot("KPM table L%d: %llx -> %llx\n", lv, desc, exec_desc);
++
++        /*
++         * Changing hierarchical execute permissions is a break-before-make
++         * update.  Merely overwriting PXNTable/UXNTable and invalidating the
++         * TLB afterwards can leave a CPU using the cached old table
++         * descriptor, which still makes an otherwise ROX leaf fault on an
++         * instruction fetch.
++         *
++         * The upper entries shared with the running KP text are already
++         * executable, so only the dedicated KPM-pool table entry reaches
++         * this path.
++         */
++        if (exec_desc != desc) {
++            *entry = 0;
++            dsb(ishst);
++            flush_tlb_all();
++
++            *entry = exec_desc;
++            dsb(ishst);
++            flush_tlb_all();
++        }
++
++        uint64_t table_pa = desc & (((1ul << (48 - page_shift)) - 1) << page_shift);
++        pxd_va = phys_to_virt(table_pa);
++    }
++
++    flush_tlb_all();
++}
++KP_EXPORT_SYMBOL(clear_table_exec_kernel);
++
+ void modify_entry_kernel(uint64_t va, uint64_t *entry, uint64_t value)
+ {
+     if (!pte_valid_cont(*entry) && !pte_valid_cont(value)) {
+@@ -253,17 +308,33 @@ static void prot_myself()
+     }
+     flush_tlb_kernel_range(_kp_extra_start, align_extra_end);
+ 
+-    // rwx for hook
++    // Hook code and metadata.
+     _kp_hook_start = (uint64_t)align_extra_end;
+     _kp_hook_end = _kp_hook_start + HOOK_ALLOC_SIZE;
+     log_boot("Hook: %llx, %llx\n", _kp_hook_start, _kp_hook_end);
+ 
+     for (uint64_t i = _kp_hook_start; i < _kp_hook_end; i += page_size) {
+         uint64_t *pte = pgtable_entry_kernel(i);
++#ifdef PAR_WX_DUAL_ALIAS
++        /* Execute through the kimage alias; write through the linear alias. */
++        *pte = (*pte | PTE_SHARED | PTE_RDONLY) & ~PTE_DBM & ~PTE_PXN & ~PTE_GP;
++#else
+         *pte = (*pte | PTE_DBM | PTE_SHARED) & ~PTE_PXN & ~PTE_RDONLY & ~PTE_GP;
++#endif
+     }
+     flush_tlb_kernel_range(_kp_hook_start, _kp_hook_end);
++#ifdef PAR_KPM_HOOK_L2_POOL
++    /*
++     * Kirin970 keeps a newly-created 2 MiB branch privileged-XN even after
++     * both its table descriptor and leaf PTEs are made executable.  Keep the
++     * hook allocator in the first quarter of the already-working hook area
++     * and reserve the remaining 768 KiB for dynamically loaded KPMs.  Both
++     * pools then execute below the same L2 descriptor as the KP text/hooks.
++     */
++    hook_mem_add(_kp_hook_start, HOOK_ALLOC_SIZE / 4);
++#else
+     hook_mem_add(_kp_hook_start, HOOK_ALLOC_SIZE);
++#endif
+ 
+     // rw memory
+     _kp_rw_start = _kp_hook_end;
+@@ -284,20 +355,34 @@ static void prot_myself()
+     kp_rox_mem = tlsf_malloc(kp_rw_mem, tlsf_size());
+     tlsf_create(kp_rox_mem);
+ 
++#ifdef PAR_KPM_HOOK_L2_POOL
++    _kp_rox_start = _kp_hook_start + HOOK_ALLOC_SIZE / 4;
++    _kp_rox_end = _kp_hook_end;
++#else
+     _kp_rox_start = _kp_rw_end;
+     _kp_rox_end = _kp_rox_start + MEMORY_ROX_SIZE;
++#endif
+     log_boot("ROX: %llx, %llx\n", _kp_rox_start, _kp_rox_end);
+ 
+-    tlsf_add_pool(kp_rox_mem, (void *)_kp_rox_start, MEMORY_ROX_SIZE);
++    void *rox_pool = (void *)_kp_rox_start;
++#ifdef PAR_WX_DUAL_ALIAS
++    rox_pool = (void *)phys_to_virt(kp_kimg_to_phys(_kp_rox_start));
++#endif
++    tlsf_add_pool(kp_rox_mem, rox_pool, _kp_rox_end - _kp_rox_start);
+ 
+     for (uint64_t i = _kp_rox_start; i < _kp_rox_end; i += page_size) {
+         uint64_t *pte = pgtable_entry_kernel(i);
++#ifdef PAR_WX_DUAL_ALIAS
++        /* Module pages start RW+NX and are split into ROX/RW by the loader. */
++        *pte = (*pte | PTE_DBM | PTE_SHARED | PTE_PXN) & ~PTE_RDONLY & ~PTE_GP;
++#else
+         *pte = (*pte | PTE_SHARED) & ~PTE_PXN & ~PTE_GP;
+         // todo: tlsf malloc block_split will write to alloced memory
+         // if (has_vmalloc_area()) {
+         // *pte |= PTE_RDONLY;
+         // *pte &= ~PTE_DBM;
+         // }
++#endif
+     }
+     flush_tlb_kernel_range(_kp_rox_start, _kp_rox_end);
+ 
+@@ -309,7 +394,17 @@ static void prot_myself()
+         kp_vm.addr = (void *)_kp_region_start;
+         kp_vm.phys_addr = kp_kimg_to_phys(_kp_region_start);
+         kp_vm.size = _kp_region_end - _kp_region_start;
++#ifdef PAR_WX_DUAL_ALIAS
++        /*
++         * Keep the original VM_MAP/VM_NO_GUARD description, and also mark
++         * the area VM_ALLOC so the kernel's set_memory_* helpers accept it.
++         * The backing pages are still owned by KernelPatch and are never
++         * passed to vfree().
++         */
++        kp_vm.flags = 0x00000046;
++#else
+         kp_vm.flags = 0x00000044;
++#endif
+         kp_vm.caller = (void *)_kp_region_start;
+         vm_area_add_early(&kp_vm);
+         log_boot("add vmalloc area: %llx, %llx\n", kp_vm.addr, kp_vm.size);
+@@ -361,7 +456,7 @@ static void log_regs()
+     // log_reg(ID_AA64ISAR2_EL1); // | R       | AArch64 Instruction Set Attribute Register 2
+     log_reg(ID_AA64MMFR0_EL1); // | R       | AArch64 Memory Model Feature Register 0
+     log_reg(ID_AA64MMFR1_EL1); // | R       | AArch64 Memory Model Feature Register 1
+-    log_reg(ID_AA64MMFR2_EL1); // | R       | AArch64 Memory Model Feature Register 2
++    // GCC 8's assembler does not know this register name; omit this debug-only log.
+     // log_reg(ID_AA64MMFR3_EL1); // | R       | AArch64 Memory Model Feature Register 3
+     // log_reg(ID_AA64MMFR4_EL1); // | R       | AArch64 Memory Model Feature Register 4
+     log_reg(ID_AA64PFR0_EL1); //  | R       | AArch64 Processor Feature Register 0
+@@ -397,14 +492,29 @@ static void log_regs()
+ 
+ static void start_init(uint64_t kimage_voff, uint64_t linear_voff)
+ {
++#ifdef PAR_DIAG_START_INIT_SECOND_HALF
++    kernel_size = start_preset.kernel_size;
++    runtime_base_addr = (uint64_t)_link_base;
++    return;
++#endif
++
+     kimage_voffset = kimage_voff;
+     linear_voffset = linear_voff;
+ 
+     kernel_pa = start_preset.kernel_pa;
+     kernel_va = kimage_voff + kernel_pa;
++
++#ifdef PAR_DIAG_START_INIT_FIRST_HALF
++    return;
++#endif
++
+     kernel_size = start_preset.kernel_size;
+     runtime_base_addr = (uint64_t)_link_base;
+ 
++#ifdef PAR_DIAG_START_INIT_GLOBALS_ONLY
++    return;
++#endif
++
+     uint64_t kallsym_addr = kernel_va + start_preset.kallsyms_lookup_name_offset;
+     kallsyms_lookup_name = (typeof(kallsyms_lookup_name))(kallsym_addr);
+     kernel_stext_va = kallsyms_lookup_name("_stext");
+@@ -413,6 +523,10 @@ static void start_init(uint64_t kimage_voff, uint64_t linear_voff)
+ 
+     vsnprintf = (typeof(vsnprintf))kallsyms_lookup_name("vsnprintf");
+ 
++#ifdef PAR_DIAG_START_INIT_AFTER_SYMS
++    return;
++#endif
++
+     log_boot(KERNEL_PATCH_BANNER);
+ 
+     endian = *(unsigned char *)&(uint16_t){ 1 } ? little : big;
+@@ -463,13 +577,64 @@ int patch();
+ 
+ int __attribute__((section(".start.text"))) __noinline start(uint64_t kimage_voff, uint64_t linear_voff)
+ {
++#ifdef PAR_DIAG_START_EMPTY
++    return 0;
++#endif
++
++#ifdef PAR_DIAG_START_WRITE_DATA_ONLY
++    /* Probe one relocated data-page store without any data-page load. */
++    asm volatile("str xzr, [%0]"
++                 :
++                 : "r"(&kimage_voffset)
++                 : "memory");
++    return 0;
++#endif
++
++#ifdef PAR_DIAG_START_READ_PRESET_ONLY
++    /*
++     * Probe the relocated data mapping without modifying it.  Keep the load
++     * in inline assembly so the compiler cannot fold it away or merge it
++     * with the later start_init() accesses.
++     */
++    uint64_t preset_kernel_pa;
++    asm volatile("ldr %0, [%1]"
++                 : "=r"(preset_kernel_pa)
++                 : "r"(&start_preset.kernel_pa)
++                 : "memory");
++    asm volatile("" : : "r"(preset_kernel_pa) : "memory");
++    return 0;
++#endif
++
+     int rc = 0;
+     start_init(kimage_voff, linear_voff);
++#if defined(PAR_DIAG_START_INIT_GLOBALS_ONLY) || \
++    defined(PAR_DIAG_START_INIT_FIRST_HALF) || \
++    defined(PAR_DIAG_START_INIT_SECOND_HALF) || \
++    defined(PAR_DIAG_START_INIT_AFTER_SYMS) || \
++    defined(PAR_DIAG_START_AFTER_INIT)
++    /*
++     * WXN was disabled by the outer mapping trampoline so this relocated
++     * start image can execute while it is still writable.  Do not restore
++     * WXN from here: doing so would make the page containing the following
++     * return instruction non-executable.  Diagnostic builds restore the
++     * original setting in map.c after this function has returned.
++     */
++    return 0;
++#endif
+     prot_myself();
++#ifndef PAR_DEDICATED_MAP_AREA
+     restore_map();
++#endif
++#ifdef PAR_DIAG_START_AFTER_RESTORE
++    /* See PAR_DIAG_START_AFTER_INIT: WXN is restored by map.c. */
++    return 0;
++#endif
+     log_regs();
+     predata_init();
+     symbol_init();
++#ifdef PAR_DIAG_START_BEFORE_PATCH
++    return 0;
++#endif
+     rc = patch();
+     return rc;
+ }
+diff --git a/kernel/include/kpmalloc.h b/kernel/include/kpmalloc.h
+index 29d0feb..184baf3 100644
+--- a/kernel/include/kpmalloc.h
++++ b/kernel/include/kpmalloc.h
+@@ -2,28 +2,54 @@
+ #define _KP_KPMALLOC_H_
+ 
+ #include <tlsf.h>
++#include <pgtable.h>
+ 
+ extern tlsf_t kp_rw_mem;
+ extern tlsf_t kp_rox_mem;
+ 
++static inline void *kp_exec_to_rw(void *ptr)
++{
++#ifdef PAR_WX_DUAL_ALIAS
++    if (ptr) return (void *)phys_to_virt(kp_kimg_to_phys((uint64_t)ptr));
++#endif
++    return ptr;
++}
++
++static inline void *kp_rw_to_exec(void *ptr)
++{
++#ifdef PAR_WX_DUAL_ALIAS
++    if (ptr) return (void *)phys_to_kimg(virt_to_phys((uint64_t)ptr));
++#endif
++    return ptr;
++}
++
+ static inline void *kp_malloc_exec(size_t bytes)
+ {
++#ifdef PAR_WX_DUAL_ALIAS
++    return kp_rw_to_exec(tlsf_memalign(kp_rox_mem, page_size, bytes));
++#else
+     return tlsf_malloc(kp_rox_mem, bytes);
++#endif
+ }
+ 
+ static inline void *kp_memalign_exec(size_t align, size_t bytes)
+ {
++#ifdef PAR_WX_DUAL_ALIAS
++    if (align < page_size) align = page_size;
++    return kp_rw_to_exec(tlsf_memalign(kp_rox_mem, align, bytes));
++#else
+     return tlsf_memalign(kp_rox_mem, align, bytes);
++#endif
+ }
+ 
+ static inline void *kp_realloc_exec(void *ptr, size_t size)
+ {
+-    return tlsf_realloc(kp_rox_mem, ptr, size);
++    return kp_rw_to_exec(tlsf_realloc(kp_rox_mem, kp_exec_to_rw(ptr), size));
+ }
+ 
+ static inline void kp_free_exec(void *ptr)
+ {
+-    tlsf_free(kp_rox_mem, ptr);
++    tlsf_free(kp_rox_mem, kp_exec_to_rw(ptr));
+ }
+ 
+ static inline void *kp_malloc(size_t bytes)
+@@ -46,4 +72,4 @@ static inline void kp_free(void *ptr)
+     tlsf_free(kp_rw_mem, ptr);
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/kernel/include/pgtable.h b/kernel/include/pgtable.h
+index 05281c3..3acb298 100644
+--- a/kernel/include/pgtable.h
++++ b/kernel/include/pgtable.h
+@@ -177,5 +177,6 @@ static inline uint64_t *pgtable_entry_kernel(uint64_t va)
+ }
+ 
+ void modify_entry_kernel(uint64_t va, uint64_t *entry, uint64_t value);
++void clear_table_exec_kernel(uint64_t va);
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/kernel/include/preset.h b/kernel/include/preset.h
+index 6f9b601..7f6d673 100644
+--- a/kernel/include/preset.h
++++ b/kernel/include/preset.h
+@@ -27,7 +27,7 @@
+ #define CONFIG_DEBUG (1 << 0)
+ #define CONFIG_ANDROID (1 << 1)
+ 
+-#define MAP_SYMBOL_NUM (5)
++#define MAP_SYMBOL_NUM (6)
+ #define MAP_SYMBOL_SIZE (MAP_SYMBOL_NUM * 8)
+ 
+ #define PATCH_CONFIG_LEN (512)
+@@ -89,6 +89,7 @@ struct map_symbol
+             uint64_t memblock_phys_alloc_relo;
+             uint64_t memblock_virt_alloc_relo;
+             uint64_t memblock_mark_nomap_relo;
++            uint64_t memstart_addr_relo;
+         };
+         char _cap[MAP_SYMBOL_SIZE];
+     };
+@@ -275,4 +276,4 @@ typedef struct
+ } preset_t;
+ #endif
+ 
+-#endif // _KP_PRESET_H_
+\ No newline at end of file
++#endif // _KP_PRESET_H_
+diff --git a/kernel/linux/arch/arm64/include/asm/cmpxchg.h b/kernel/linux/arch/arm64/include/asm/cmpxchg.h
+index dd36974..e4dde34 100644
+--- a/kernel/linux/arch/arm64/include/asm/cmpxchg.h
++++ b/kernel/linux/arch/arm64/include/asm/cmpxchg.h
+@@ -64,6 +64,7 @@ static inline unsigned long __xchg(unsigned long x, volatile void *ptr, int size
+         break;
+     default:
+         // BUILD_BUG();
++        break;
+     }
+ 
+     smp_mb();
+@@ -144,6 +145,7 @@ static inline unsigned long __cmpxchg(volatile void *ptr, unsigned long old, uns
+ 
+     default:
+         // BUILD_BUG();
++        break;
+     }
+ 
+     return oldval;
+@@ -179,4 +181,4 @@ static inline unsigned long __cmpxchg_mb(volatile void *ptr, unsigned long old,
+ 
+ #define cmpxchg64_relaxed(ptr, o, n) cmpxchg_local((ptr), (o), (n))
+ 
+-#endif /* __ASM_CMPXCHG_H */
+\ No newline at end of file
++#endif /* __ASM_CMPXCHG_H */
+diff --git a/kernel/patch/module/module.c b/kernel/patch/module/module.c
+index c0fe197..e04d0d5 100644
+--- a/kernel/patch/module/module.c
++++ b/kernel/patch/module/module.c
+@@ -164,7 +164,7 @@ static bool is_core_symbol(const Elf_Sym *src, const Elf_Shdr *sechdrs, unsigned
+ static int simplify_symbols(struct module *mod, const struct load_info *info)
+ {
+     Elf_Shdr *symsec = &info->sechdrs[info->index.sym];
+-    Elf_Sym *sym = (void *)symsec->sh_addr;
++    Elf_Sym *sym = kp_exec_to_rw((void *)symsec->sh_addr);
+     unsigned long secbase;
+     unsigned int i;
+     int ret = 0;
+@@ -276,7 +276,8 @@ static int move_module(struct module *mod, struct load_info *info)
+     if (!mod->start) {
+         return -ENOMEM;
+     }
+-    memset(mod->start, 0, mod->size);
++    void *rw_start = kp_exec_to_rw(mod->start);
++    memset(rw_start, 0, mod->size);
+ 
+     /* Transfer each section which specifies SHF_ALLOC */
+     logkd("final section addresses:\n");
+@@ -287,11 +288,12 @@ static int move_module(struct module *mod, struct load_info *info)
+         if (!(shdr->sh_flags & SHF_ALLOC)) continue;
+ 
+         dest = mod->start + shdr->sh_entsize;
++        void *rw_dest = rw_start + shdr->sh_entsize;
+         const char *sname = info->secstrings + shdr->sh_name;
+ 
+         logkd("    %s %llx %llx\n", sname, dest, shdr->sh_size);
+ 
+-        if (shdr->sh_type != SHT_NOBITS) memcpy(dest, (void *)shdr->sh_addr, shdr->sh_size);
++        if (shdr->sh_type != SHT_NOBITS) memcpy(rw_dest, (void *)shdr->sh_addr, shdr->sh_size);
+ 
+         shdr->sh_addr = (unsigned long)dest;
+ 
+@@ -314,6 +316,80 @@ static int move_module(struct module *mod, struct load_info *info)
+     return 0;
+ }
+ 
++static void protect_module(struct module *mod)
++{
++#ifdef PAR_WX_DUAL_ALIAS
++    uint64_t start = (uint64_t)mod->start;
++    uint64_t ro_end = start + mod->ro_size;
++    uint64_t end = ALIGN(start + mod->size, page_size);
++    int ro_pages = (ro_end - start) / page_size;
++    int rw_pages = (end - ro_end) / page_size;
++    typedef int (*set_memory_fn_t)(unsigned long addr, int numpages);
++    set_memory_fn_t set_memory_ro = (set_memory_fn_t)kallsyms_lookup_name("set_memory_ro");
++    set_memory_fn_t set_memory_rw = (set_memory_fn_t)kallsyms_lookup_name("set_memory_rw");
++    set_memory_fn_t set_memory_x = (set_memory_fn_t)kallsyms_lookup_name("set_memory_x");
++    set_memory_fn_t set_memory_nx = (set_memory_fn_t)kallsyms_lookup_name("set_memory_nx");
++    uint64_t *first_pte = pgtable_entry_kernel(start);
++    uint64_t before_pte = first_pte ? *first_pte : 0;
++
++    __flush_dcache_area(kp_exec_to_rw(mod->start), mod->size);
++    clear_table_exec_kernel(start);
++
++    if (set_memory_ro && set_memory_rw && set_memory_x && set_memory_nx) {
++        int rc_ro = set_memory_ro(start, ro_pages);
++        int rc_x = set_memory_x(start, ro_pages);
++        int rc_rw = set_memory_rw(ro_end, rw_pages);
++        int rc_nx = set_memory_nx(ro_end, rw_pages);
++        logkfi("KPM native protect: ro=%d x=%d rw=%d nx=%d\n", rc_ro, rc_x, rc_rw, rc_nx);
++    } else {
++        logkfe("KPM native set_memory helpers unavailable, using PTE fallback\n");
++        for (uint64_t addr = start; addr < end; addr += page_size) {
++            uint64_t *pte = pgtable_entry_kernel(addr);
++            if (addr < ro_end) {
++                *pte = (*pte | PTE_SHARED | PTE_RDONLY) & ~PTE_DBM & ~PTE_PXN & ~PTE_GP;
++            } else {
++                *pte = (*pte | PTE_DBM | PTE_SHARED | PTE_PXN) & ~PTE_RDONLY & ~PTE_GP;
++            }
++        }
++        flush_tlb_all();
++    }
++
++    /*
++     * Some Kirin970 mappings make set_memory_x() return success without
++     * actually clearing the leaf PXN bit.  Read the live PTEs back and
++     * enforce the final W^X state instead of trusting the helper's return
++     * value: code/rodata is ROX, while module data remains RW+NX.
++     */
++    int fixed_rox = 0;
++    int fixed_rwnx = 0;
++    for (uint64_t addr = start; addr < end; addr += page_size) {
++        uint64_t *pte = pgtable_entry_kernel(addr);
++        uint64_t old_pte = *pte;
++        uint64_t new_pte;
++
++        if (addr < ro_end) {
++            new_pte = (old_pte | PTE_SHARED | PTE_RDONLY) &
++                      ~PTE_DBM & ~PTE_PXN & ~PTE_GP;
++            if (new_pte != old_pte) fixed_rox++;
++        } else {
++            new_pte = (old_pte | PTE_DBM | PTE_SHARED | PTE_PXN) &
++                      ~PTE_RDONLY & ~PTE_GP;
++            if (new_pte != old_pte) fixed_rwnx++;
++        }
++
++        if (new_pte != old_pte)
++            modify_entry_kernel(addr, pte, new_pte);
++    }
++    logkfi("KPM PTE verify: fixed_rox=%d fixed_rwnx=%d\n",
++           fixed_rox, fixed_rwnx);
++
++    first_pte = pgtable_entry_kernel(start);
++    logkfi("KPM text PTE: %llx -> %llx, range: %llx-%llx-%llx\n",
++           before_pte, first_pte ? *first_pte : 0, start, ro_end, end);
++#endif
++    flush_icache_all();
++}
++
+ static int setup_load_info(struct load_info *info)
+ {
+     int rc = 0;
+@@ -431,7 +507,7 @@ long load_module(const void *data, int len, const char *args, const char *event,
+     if ((rc = simplify_symbols(mod, info))) goto free;
+     if ((rc = apply_relocations(mod, info))) goto free;
+ 
+-    flush_icache_all();
++    protect_module(mod);
+ 
+     rc = (*mod->init)(mod->args, event, reserved);
+ 
+@@ -663,4 +739,4 @@ void module_init()
+ {
+     INIT_LIST_HEAD(&modules.list);
+     spin_lock_init(&module_lock);
+-}
+\ No newline at end of file
++}
+diff --git a/kernel/patch/module/relo.c b/kernel/patch/module/relo.c
+index 3b8ce04..f22cd9a 100644
+--- a/kernel/patch/module/relo.c
++++ b/kernel/patch/module/relo.c
+@@ -3,6 +3,7 @@
+ #include <uapi/linux/elf.h>
+ #include <asm/elf.h>
+ #include <linux/err.h>
++#include <kpmalloc.h>
+ 
+ #include "insn.h"
+ 
+@@ -39,18 +40,19 @@ static u64 do_reloc(enum aarch64_reloc_op reloc_op, void *place, u64 val)
+ 
+ static int reloc_data(enum aarch64_reloc_op op, void *place, u64 val, int len)
+ {
++    void *write_place = kp_exec_to_rw(place);
+     u64 imm_mask = (1 << len) - 1;
+     s64 sval = do_reloc(op, place, val);
+ 
+     switch (len) {
+     case 16:
+-        *(s16 *)place = sval;
++        *(s16 *)write_place = sval;
+         break;
+     case 32:
+-        *(s32 *)place = sval;
++        *(s32 *)write_place = sval;
+         break;
+     case 64:
+-        *(s64 *)place = sval;
++        *(s64 *)write_place = sval;
+         break;
+     default:
+         pr_err("Invalid length (%d) for data relocation\n", len);
+@@ -76,7 +78,8 @@ static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val, int l
+ {
+     u64 imm, limit = 0;
+     s64 sval;
+-    u32 insn = le32_to_cpu(*(u32 *)place);
++    void *write_place = kp_exec_to_rw(place);
++    u32 insn = le32_to_cpu(*(u32 *)write_place);
+ 
+     sval = do_reloc(op, place, val);
+     sval >>= lsb;
+@@ -106,7 +109,7 @@ static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val, int l
+ 
+     /* Update the instruction with the new encoding. */
+     insn = aarch64_insn_encode_immediate(imm_type, insn, imm);
+-    *(u32 *)place = cpu_to_le32(insn);
++    *(u32 *)write_place = cpu_to_le32(insn);
+ 
+     /* Shift out the immediate field. */
+     sval >>= 16;
+@@ -133,7 +136,8 @@ static int reloc_insn_imm(enum aarch64_reloc_op op, void *place, u64 val, int ls
+ {
+     u64 imm, imm_mask;
+     s64 sval;
+-    u32 insn = le32_to_cpu(*(u32 *)place);
++    void *write_place = kp_exec_to_rw(place);
++    u32 insn = le32_to_cpu(*(u32 *)write_place);
+ 
+     /* Calculate the relocation value. */
+     sval = do_reloc(op, place, val);
+@@ -143,7 +147,7 @@ static int reloc_insn_imm(enum aarch64_reloc_op op, void *place, u64 val, int ls
+     imm = sval & imm_mask;
+     /* Update the instruction's immediate field. */
+     insn = aarch64_insn_encode_immediate(imm_type, insn, imm);
+-    *(u32 *)place = cpu_to_le32(insn);
++    *(u32 *)write_place = cpu_to_le32(insn);
+     /*
+ 	 * Extract the upper value bits (including the sign bit) and
+ 	 * shift them to bit 0.
+@@ -179,7 +183,7 @@ int apply_relocate_add(Elf64_Shdr *sechdrs, const char *strtab, unsigned int sym
+         /* loc corresponds to P in the AArch64 ELF document. */
+         loc = (void *)sechdrs[sechdrs[relsec].sh_info].sh_addr + rel[i].r_offset;
+         /* sym is the ELF symbol we're referring to. */
+-        sym = (Elf64_Sym *)sechdrs[symindex].sh_addr + ELF64_R_SYM(rel[i].r_info);
++        sym = (Elf64_Sym *)kp_exec_to_rw((void *)sechdrs[symindex].sh_addr) + ELF64_R_SYM(rel[i].r_info);
+         /* val corresponds to (S + A) in the AArch64 ELF document. */
+         val = sym->st_value + rel[i].r_addend;
+ 
+@@ -334,4 +338,4 @@ int apply_relocate_add(Elf64_Shdr *sechdrs, const char *strtab, unsigned int sym
+ overflow:
+     pr_err("overflow in relocation type %d val %llx\n", (int)ELF64_R_TYPE(rel[i].r_info), val);
+     return -ENOEXEC;
+-}
+\ No newline at end of file
++}
+diff --git a/kernel/patch/sukisu/sukisu.c b/kernel/patch/sukisu/sukisu.c
+index 86e8177..a31f967 100644
+--- a/kernel/patch/sukisu/sukisu.c
++++ b/kernel/patch/sukisu/sukisu.c
+@@ -112,6 +112,13 @@ void before_sukisu_kpm_list(hook_fargs3_t* args, void* udata) {
+     int len = (int) args->arg1;
+     int * result = (void*) args->arg2;
+ 
++    /*
++     * SukiSU copies the full requested buffer back to userspace even when
++     * the list result is shorter (including an empty list).  Zero it first
++     * so the UI sees a terminated empty string instead of stale kernel-stack
++     * bytes, and so no stack contents are disclosed to userspace.
++     */
++    if (out && len > 0) memset(out, 0, len);
+     int res = (int) call_kpm_list(out, len);
+     
+     *result = res;
+@@ -207,4 +214,4 @@ void init_sukisu_ultra() {
+         log_boot("hook sukisu_kpm_version faild \n", rc);
+     }
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/tools/preset.h b/tools/preset.h
+index b071874..edf3891 100644
+--- a/tools/preset.h
++++ b/tools/preset.h
+@@ -28,7 +28,7 @@
+ #define CONFIG_DEBUG (1 << 0)
+ #define CONFIG_ANDROID (1 << 1)
+ 
+-#define MAP_SYMBOL_NUM (5)
++#define MAP_SYMBOL_NUM (6)
+ #define MAP_SYMBOL_SIZE (MAP_SYMBOL_NUM * 8)
+ 
+ #define PATCH_CONFIG_LEN (512)
+@@ -90,6 +90,7 @@ struct map_symbol
+             uint64_t memblock_phys_alloc_relo;
+             uint64_t memblock_virt_alloc_relo;
+             uint64_t memblock_mark_nomap_relo;
++            uint64_t memstart_addr_relo;
+         };
+         char _cap[MAP_SYMBOL_SIZE];
+     };
+@@ -276,4 +277,4 @@ typedef struct
+ } preset_t;
+ #endif
+ 
+-#endif // _KP_PRESET_H_
+\ No newline at end of file
++#endif // _KP_PRESET_H_
+diff --git a/tools/symbol.c b/tools/symbol.c
+index 8f52720..3c31b20 100644
+--- a/tools/symbol.c
++++ b/tools/symbol.c
+@@ -59,7 +59,8 @@ int32_t try_get_symbol_offset_zero(kallsym_t *info, char *img, char *symbol)
+ void select_map_area(kallsym_t *kallsym, char *image_buf, int32_t *map_start, int32_t *max_size)
+ {
+     int32_t addr = 0x200;
+-    addr = get_symbol_offset_exit(kallsym, image_buf, "tcp_init_sock");
++    addr = get_symbol_offset_zero(kallsym, image_buf, "kpm_early_map_area");
++    if (!addr) addr = get_symbol_offset_exit(kallsym, image_buf, "tcp_init_sock");
+     
+     *map_start = align_floor(addr, 16);
+     *max_size = 0x800;
+@@ -118,6 +119,7 @@ int fillin_map_symbol(kallsym_t *kallsym, char *img_buf, map_symbol_t *symbol, i
+     symbol->memblock_free_relo = get_symbol_offset_exit(kallsym, img_buf, "memblock_free");
+ 
+     symbol->memblock_mark_nomap_relo = get_symbol_offset_zero(kallsym, img_buf, "memblock_mark_nomap");
++    symbol->memstart_addr_relo = get_symbol_offset_zero(kallsym, img_buf, "memstart_addr");
+ 
+     symbol->memblock_phys_alloc_relo = get_symbol_offset_zero(kallsym, img_buf, "memblock_phys_alloc_try_nid");
+     symbol->memblock_virt_alloc_relo = get_symbol_offset_zero(kallsym, img_buf, "memblock_virt_alloc_try_nid");

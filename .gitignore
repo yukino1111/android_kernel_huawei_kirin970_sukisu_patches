@@ -1,0 +1,19 @@
+# Local verification/build output
+/out/
+/build/
+*.o
+*.a
+*.ko
+*.cmd
+*.mod.c
+
+# Kernel images and full local logs belong in external artifacts
+*.img
+/artifacts/candidates/
+/logs/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
