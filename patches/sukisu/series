@@ -1,2 +1,3 @@
 0001-par-nongki-susfs2-compat.patch
 0002-reproducible-offline-version.patch
+0003-gate-sucompat-by-authorized-uid.patch
