@@ -1,0 +1,26 @@
+diff --git a/drivers/vcodec/hi_vcodec/vdec_hivna/vfmw_v4.0/firmware/hal/HiSMMUV150/smmu.c b/drivers/vcodec/hi_vcodec/vdec_hivna/vfmw_v4.0/firmware/hal/HiSMMUV150/smmu.c
+index 91cb4270d..a81a6f196 100755
+--- a/drivers/vcodec/hi_vcodec/vdec_hivna/vfmw_v4.0/firmware/hal/HiSMMUV150/smmu.c
++++ b/drivers/vcodec/hi_vcodec/vdec_hivna/vfmw_v4.0/firmware/hal/HiSMMUV150/smmu.c
+@@ -331,11 +331,21 @@ static SINT32 alloc_smmu_tlb_miss_addr(VOID)
+ 
+ VOID SMMU_ConfigSMR(VOID)
+ {
++#ifdef ENV_SOS_KERNEL
+ 	UINT32 i = 0;
+ 	for(i = 0; i < SMRx_ID_SIZE; i++)
+ 	{
+ 		set_common_reg(SMMU_SMRx_P + i * 0x4, 0x0, 32, 0); //smmu_smrx_p.smr_prtectec_en=1
+ 	}
++#else
++	/*
++	 * SMMU_SMRx_P is the protected stream-mapping bank.  Accessing it
++	 * from the non-secure Linux kernel raises a VDEC NoC permission fault
++	 * on Kirin 970.  The normal-world stream mappings are configured via
++	 * SMMU_SMRx_NS in SMMU_InitGlobalReg(), so leave the protected bank to
++	 * the secure-world implementation.
++	 */
++#endif
+ }
+ 
+ /**
